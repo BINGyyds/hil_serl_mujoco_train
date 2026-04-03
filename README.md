@@ -28,6 +28,14 @@ cd train
 conda activate hil_serl_actor
 ```
 
+如果本地 actor 机器是 Ubuntu：
+
+```bash
+cd train
+./setup_env_actor_ubuntu.sh
+conda activate hil_serl_actor
+```
+
 ### 远端 learner
 
 ```bash
