@@ -1,5 +1,7 @@
-from scripts.experiments.mujoco_reach.config import TrainConfig as MujocoReachTrainConfig
+from scripts.experiments.mujoco_insertion.config import (
+    TrainConfig as MujocoInsertionTrainConfig,
+)
 
 CONFIG_MAPPING = {
-    "mujoco_reach": MujocoReachTrainConfig,
+    "mujoco_insertion": MujocoInsertionTrainConfig,
 }

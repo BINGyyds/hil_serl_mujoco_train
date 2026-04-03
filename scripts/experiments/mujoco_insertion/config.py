@@ -1,9 +1,9 @@
 """
-Training configuration for the MuJoCo Franka Reach task with HIL (SpaceMouse).
+Training configuration for the MuJoCo Franka insertion task with SpaceMouse HIL.
 """
 
-from robot_controllers_mujoco.configs.reach_config import make_reach_config
-from robot_controllers_mujoco.envs.franka_reach_env import FrankaReachEnv
+from robot_controllers_mujoco.configs.insertion_config import make_insertion_config
+from robot_controllers_mujoco.envs.franka_insertion_env import FrankaInsertionEnv
 from robot_controllers_mujoco.envs.wrappers import (
     MujocoSERLObsWrapper,
     MujocoSpacemouseIntervention,
@@ -13,15 +13,22 @@ from serl_launcher.wrappers.chunking import ChunkingWrapper
 
 
 class TrainConfig(DefaultTrainingConfig):
-    # State-only (no images for Phase 1)
     image_keys = []
     classifier_keys = []
-    proprio_keys = ["tcp_pose", "tcp_vel", "q_pos", "q_vel", "target_pose"]
+    proprio_keys = [
+        "tcp_pose",
+        "tcp_vel",
+        "q_pos",
+        "q_vel",
+        "socket_pose",
+        "relative_pose",
+        "insertion_depth",
+        "controller_target_pose",
+    ]
     setup_mode = "single-arm-fixed-gripper"
     encoder_type = "none"
     use_reward_classifier = False
 
-    # Training hyper-parameters
     max_traj_length = 200
     batch_size = 256
     discount = 0.99
@@ -38,8 +45,8 @@ class TrainConfig(DefaultTrainingConfig):
     buffer_period = 1000
 
     def get_environment(self, fake_env=False, save_video=False, classifier=False):
-        cfg = make_reach_config()
-        env = FrankaReachEnv(
+        cfg = make_insertion_config()
+        env = FrankaInsertionEnv(
             config=cfg,
             render_mode="human" if not fake_env else None,
         )

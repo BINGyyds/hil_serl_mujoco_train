@@ -62,9 +62,10 @@ info "安装 hil_serl_train"
 pip install -e "$PROJECT_DIR[distributed,sb3]"
 
 python -c "
-from robot_controllers_mujoco import FrankaReachEnv, make_reach_config
+from robot_controllers_mujoco.configs.insertion_config import make_insertion_config
+from robot_controllers_mujoco.envs.franka_insertion_env import FrankaInsertionEnv
 from serl_launcher.agents.continuous.sac import SACAgent
-env = FrankaReachEnv(config=make_reach_config())
+env = FrankaInsertionEnv(config=make_insertion_config())
 env.reset()
 env.close()
 print('actor env ok')
@@ -74,4 +75,4 @@ print('serl_launcher ok')
 echo
 info "环境已准备完成。"
 info "激活环境: conda activate $ENV_NAME"
-info "启动 actor: python scripts/train_rlpd_mujoco.py --exp_name mujoco_reach --actor --ip localhost"
+info "启动 actor: python scripts/train_rlpd_mujoco.py --exp_name mujoco_insertion --actor --ip localhost --checkpoint_path output/mujoco_insertion_actor"

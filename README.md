@@ -1,90 +1,88 @@
 # hil_serl_mujoco_train
 
-这个目录是未来独立 GitHub 仓库 `hil_serl_mujoco_train` 的本地形态，负责强化学习训练侧能力。
-
-说明：
-
-- GitHub 仓库名：`hil_serl_mujoco_train`
-- 父仓挂载目录名：`train/`
-- 当前 Python 包名 / 发行名：`hil_serl_train`
-
-## 包含内容
+`train/` 是强化学习训练侧仓库，负责：
 
 - `serl_launcher`
-- `scripts/train_sac_reach.py`
 - `scripts/train_rlpd_mujoco.py`
-- `scripts/experiments/mujoco_reach/`
+- `scripts/experiments/mujoco_insertion`
+- actor / learner 分布式训练
+- replay buffer、demo buffer、checkpoint
 
-当前主线只保留 `mujoco_reach`。
+它不再维护第二份 MuJoCo 环境和模型，而是直接依赖旁边 `sim/` 里的 `robot_controllers_mujoco`。
 
-## 依赖关系
+## 当前主线
 
-训练仓不再维护第二份 MuJoCo 环境和模型。
+当前默认主线已经切到：
 
-它直接依赖：
+- `mujoco_insertion`
+- 少量 demo 预热
+- 在线 HIL-RLPD
 
-- `robot_controllers_mujoco`
+## 环境安装
 
-也就是 `sim/` 对应的独立仓库。
-
-## 本地 actor 安装
+### 本地 actor
 
 ```bash
-bash setup_env_actor_mac.sh
+cd train
+./setup_env_actor_mac.sh
 conda activate hil_serl_actor
 ```
 
-## AutoDL learner 安装
+### 远端 learner
 
 ```bash
-bash setup_env_autodl.sh
+cd train
+./setup_env_autodl.sh
 conda activate hil_serl_train
 ```
 
-## 为什么有两个 setup 脚本
+这两个脚本都会优先尝试安装旁边的 `sim/`，所以推荐目录保持：
 
-- `setup_env_actor_mac.sh`
-  - 给本地 Mac 的 actor 用
-  - 安装 CPU JAX
-  - 用于本地启动 `--actor`
-
-- `setup_env_autodl.sh`
-  - 给远程 AutoDL learner 用
-  - 安装 CUDA JAX
-  - 用于远程启动 `--learner`
-
-它们分别服务两台不同机器，所以保留两个脚本是有必要的。
+```text
+hil_serl_mujoco/
+├── sim/
+└── train/
+```
 
 ## 训练入口
 
 ### learner
 
 ```bash
-python scripts/train_rlpd_mujoco.py --exp_name mujoco_reach --learner \
-  --demo_path demo_data/reach_demos.pkl \
-  --checkpoint_path output/reach_hil
+python scripts/train_rlpd_mujoco.py \
+  --exp_name mujoco_insertion \
+  --learner \
+  --demo_path demo_data/insertion_demos.pkl \
+  --checkpoint_path output/mujoco_insertion
 ```
 
 ### actor
 
 ```bash
-python scripts/train_rlpd_mujoco.py --exp_name mujoco_reach --actor --ip localhost
+python scripts/train_rlpd_mujoco.py \
+  --exp_name mujoco_insertion \
+  --actor \
+  --ip localhost \
+  --checkpoint_path output/mujoco_insertion_actor
 ```
 
-## 备注
+## 依赖关系
 
-- Mac actor 环境用 CPU JAX 即可
-- AutoDL learner 环境使用 CUDA JAX
-- 如果你把 `sim/` 和 `train/` 拆成独立仓库，推荐并排 clone，方便安装脚本自动找到 `robot_controllers_mujoco`
+- `sim/`
+  - MuJoCo 环境、MJCF、SpaceMouse、demo 录制
+- `train/`
+  - learner / actor、训练配置、buffer、checkpoint
 
-## 推送到 GitHub
+`train` 仓默认不单独录 demo。插入 demo 统一在 `sim/scripts/record_demos_mujoco.py` 中录制。
 
-```bash
-cd train
-git init
-git add .
-git commit -m "Initial commit for hil_serl_mujoco_train"
-git branch -M main
-git remote add origin git@github.com:<your-name>/hil_serl_mujoco_train.git
-git push -u origin main
-```
+## 推荐操作顺序
+
+1. 先在 `sim_env` 中录 `demo_data/insertion_demos.pkl`
+2. 把 demo 传到远端 learner
+3. 远端启动 learner
+4. 本地启动 actor
+5. 再做 SpaceMouse intervention
+
+## 完整部署文档
+
+跨本地 `sim/`、本地 actor、远端 learner 的完整部署步骤，统一写在父仓 [`README.md`](/home/lrb/Workspace/hil_serl_mujoco/README.md)。

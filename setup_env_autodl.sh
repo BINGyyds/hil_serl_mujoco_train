@@ -60,9 +60,10 @@ pip install -e "$PROJECT_DIR[distributed,sb3]"
 python -c "
 import jax
 from serl_launcher.agents.continuous.sac import SACAgent
-from robot_controllers_mujoco import FrankaReachEnv, make_reach_config
+from robot_controllers_mujoco.configs.insertion_config import make_insertion_config
+from robot_controllers_mujoco.envs.franka_insertion_env import FrankaInsertionEnv
 print('jax devices:', jax.devices())
-env = FrankaReachEnv(config=make_reach_config())
+env = FrankaInsertionEnv(config=make_insertion_config())
 env.reset()
 env.close()
 print('serl_launcher ok')
@@ -73,4 +74,4 @@ echo
 info "环境已准备完成。"
 info "激活环境: conda activate $ENV_NAME"
 info "推荐 GPU: 当前主线 4090 足够，5090 适合后续更重实验。"
-info "启动 learner: python scripts/train_rlpd_mujoco.py --exp_name mujoco_reach --learner --demo_path demo_data/reach_demos.pkl --checkpoint_path output/reach_hil"
+info "启动 learner: python scripts/train_rlpd_mujoco.py --exp_name mujoco_insertion --learner --demo_path demo_data/insertion_demos.pkl --checkpoint_path output/mujoco_insertion"

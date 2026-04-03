@@ -8,11 +8,12 @@ and ReplayBufferDataStore (not the memory-efficient pixel variant).
 
 Usage:
     # 1) Start the learner (with GPU):
-    python scripts/train_rlpd_mujoco.py --exp_name mujoco_reach --learner \
-        --demo_path demo_data/reach_demos.pkl --checkpoint_path output/reach_hil
+    python scripts/train_rlpd_mujoco.py --exp_name mujoco_insertion --learner \
+        --demo_path demo_data/insertion_demos.pkl --checkpoint_path output/mujoco_insertion
 
     # 2) Start the actor (with SpaceMouse + MuJoCo visualisation):
-    python scripts/train_rlpd_mujoco.py --exp_name mujoco_reach --actor --ip localhost
+    python scripts/train_rlpd_mujoco.py --exp_name mujoco_insertion --actor --ip localhost \
+        --checkpoint_path output/mujoco_insertion_actor
 """
 
 from __future__ import annotations
