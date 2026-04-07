@@ -44,6 +44,15 @@ cd train
 conda activate hil_serl_train
 ```
 
+当前 `train` 默认固定到一组兼容版本：
+
+- Python 3.11
+- actor：CPU JAX `0.6.2`
+- learner：GPU JAX `0.6.2` + `jax-cuda12-plugin[with-cuda]`
+- `TFP 0.25.0`、`Distrax 0.1.5`、`Flax 0.10.7`、`Optax 0.2.8`
+
+具体约束写在 `train/constraints/` 目录下，避免 JAX / TFP / Distrax 版本漂移。
+
 这两个脚本都会优先尝试安装旁边的 `sim/`，所以推荐目录保持：
 
 ```text

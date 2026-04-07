@@ -7,42 +7,37 @@ name = "hil_serl_train"
 version = "0.1.0"
 description = "Training-side repository for MuJoCo-based HIL-SERL experiments"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
-  "absl-py>=0.12.0",
-  "chex>=0.1.85",
-  "distrax>=0.1.2",
-  "einops>=0.6.1",
-  "flax>=0.8.0",
+  "absl-py==2.3.1",
+  "chex==0.1.90",
+  "distrax==0.1.5",
+  "einops==0.8.1",
+  "flax==0.10.7",
   "gymnasium==0.29.1",
-  "imageio>=2.31.1",
-  "lz4",
-  "matplotlib",
-  "ml_collections>=0.1.0",
-  "moviepy>=1.0.3",
-  "mujoco>=3.0.0",
-  "natsort",
-  "numpy>=1.24.3",
-  "opencv-python",
-  "optax>=0.1.5",
-  "pynput",
-  "scipy==1.11.4",
-  "tensorflow>=2.15.0",
-  "tensorflow_probability>=0.23.0",
-  "tf-keras",
-  "tomli>=2.0.1",
-  "tqdm>=4.60.0",
-  "typing_extensions",
-  "wandb>=0.12.14",
+  "imageio==2.37.0",
+  "lz4==4.4.4",
+  "matplotlib==3.10.1",
+  "ml_collections==1.0.0",
+  "moviepy==1.0.3",
+  "mujoco==3.6.0",
+  "natsort==8.4.0",
+  "numpy==1.26.4",
+  "opencv-python==4.10.0.84",
+  "optax==0.2.8",
+  "pynput==1.8.1",
+  "scipy==1.15.3",
+  "tensorflow-probability==0.25.0",
+  "tomli==2.2.1",
+  "tqdm==4.67.1",
+  "typing_extensions==4.15.0",
+  "wandb==0.19.9",
 ]
 
 [project.optional-dependencies]
 distributed = [
-  "pyzmq",
+  "pyzmq==26.4.0",
   "agentlace @ git+https://github.com/youliangtan/agentlace.git@cf2c337c5e3694cdbfc14831b239bd657bc4894d",
-]
-sb3 = [
-  "stable-baselines3",
 ]
 
 [tool.setuptools.packages.find]

@@ -2,11 +2,12 @@
 set -euo pipefail
 
 ENV_NAME="${ENV_NAME:-hil_serl_actor}"
-PYTHON_VERSION="${PYTHON_VERSION:-3.10}"
+PYTHON_VERSION="${PYTHON_VERSION:-3.11}"
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SIM_REPO_PATH="${ROBOT_CONTROLLERS_MUJOCO_PATH:-}"
 SKIP_APT="${SKIP_APT:-0}"
 CONDA_CHANNEL_ARGS=(--override-channels -c conda-forge -c defaults)
+CONSTRAINTS_FILE="${PROJECT_DIR}/constraints/actor_cpu_py311.txt"
 
 info()  { echo -e "\033[92m[INFO]\033[0m $*"; }
 warn()  { echo -e "\033[93m[WARN]\033[0m $*"; }
@@ -78,9 +79,6 @@ conda activate "$ENV_NAME"
 info "升级 pip / setuptools / wheel"
 python -m pip install --upgrade pip setuptools wheel
 
-info "安装 JAX CPU"
-python -m pip install --upgrade jax jaxlib
-
 if [[ -d "$SIM_REPO_PATH" ]]; then
     info "安装 sibling sim 仓: $SIM_REPO_PATH"
     python -m pip install -e "$SIM_REPO_PATH"
@@ -89,7 +87,34 @@ else
 fi
 
 info "安装 hil_serl_train"
-python -m pip install -e "$PROJECT_DIR[distributed,sb3]"
+python -m pip install -e "$PROJECT_DIR[distributed]"
+
+info "清理与 actor 兼容路线冲突的旧 GPU/ML 依赖"
+python -m pip uninstall -y \
+    stable-baselines3 \
+    torch \
+    tensorflow \
+    tf-keras \
+    keras \
+    cuda-toolkit \
+    cuda-bindings \
+    triton \
+    nvidia-cudnn-cu13 \
+    nvidia-cusparselt-cu13 \
+    nvidia-nccl-cu13 \
+    nvidia-nvshmem-cu13 \
+    nvidia-cuda-runtime-cu13 \
+    nvidia-cublas-cu13 \
+    nvidia-cuda-cupti-cu13 \
+    nvidia-cuda-nvrtc-cu13 \
+    nvidia-cufft-cu13 \
+    nvidia-curand-cu13 \
+    nvidia-cusolver-cu13 \
+    nvidia-cusparse-cu13 \
+    nvidia-nvjitlink-cu13 || true
+
+info "安装 actor 精确约束版本（CPU JAX 0.6.2）"
+python -m pip install --upgrade --force-reinstall -r "$CONSTRAINTS_FILE"
 
 python -c "
 import jax
