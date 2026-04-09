@@ -82,7 +82,75 @@ pip uninstall -y \
 info "安装 learner 精确约束版本（JAX 0.6.2 + bundled CUDA/cuDNN）"
 pip install --upgrade --force-reinstall -r "$CONSTRAINTS_FILE"
 
-python -c "
+ACTIVATE_DIR="$CONDA_PREFIX/etc/conda/activate.d"
+DEACTIVATE_DIR="$CONDA_PREFIX/etc/conda/deactivate.d"
+mkdir -p "$ACTIVATE_DIR" "$DEACTIVATE_DIR"
+
+cat > "$ACTIVATE_DIR/hil_serl_train_cuda_paths.sh" <<'EOF'
+#!/usr/bin/env bash
+export _HIL_SERL_TRAIN_OLD_LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}"
+
+_hil_serl_train_filtered_ld="$(
+python - <<'PY'
+import os
+
+raw = os.environ.get("LD_LIBRARY_PATH", "")
+parts = [p for p in raw.split(":") if p]
+filtered = []
+seen = set()
+for part in parts:
+    if part.startswith("/usr/local/cuda"):
+        continue
+    if part in seen:
+        continue
+    seen.add(part)
+    filtered.append(part)
+print(":".join(filtered))
+PY
+)"
+
+_hil_serl_train_bundled_cuda="$(
+python - <<'PY'
+import os
+import site
+
+base = site.getsitepackages()[0]
+ordered = [
+    os.path.join(base, "nvidia", "nvjitlink", "lib"),
+    os.path.join(base, "nvidia", "cublas", "lib"),
+    os.path.join(base, "nvidia", "cuda_cupti", "lib"),
+    os.path.join(base, "nvidia", "cuda_runtime", "lib"),
+    os.path.join(base, "nvidia", "cudnn", "lib"),
+    os.path.join(base, "nvidia", "cusparse", "lib"),
+]
+existing = [p for p in ordered if os.path.isdir(p)]
+print(":".join(existing))
+PY
+)"
+
+if [[ -n "$_hil_serl_train_bundled_cuda" && -n "$_hil_serl_train_filtered_ld" ]]; then
+    export LD_LIBRARY_PATH="${_hil_serl_train_bundled_cuda}:${_hil_serl_train_filtered_ld}"
+elif [[ -n "$_hil_serl_train_bundled_cuda" ]]; then
+    export LD_LIBRARY_PATH="${_hil_serl_train_bundled_cuda}"
+else
+    export LD_LIBRARY_PATH="${_hil_serl_train_filtered_ld}"
+fi
+
+unset _hil_serl_train_filtered_ld
+unset _hil_serl_train_bundled_cuda
+EOF
+
+cat > "$DEACTIVATE_DIR/hil_serl_train_cuda_paths.sh" <<'EOF'
+#!/usr/bin/env bash
+if [[ -n "${_HIL_SERL_TRAIN_OLD_LD_LIBRARY_PATH+x}" ]]; then
+    export LD_LIBRARY_PATH="${_HIL_SERL_TRAIN_OLD_LD_LIBRARY_PATH}"
+    unset _HIL_SERL_TRAIN_OLD_LD_LIBRARY_PATH
+fi
+EOF
+
+source "$ACTIVATE_DIR/hil_serl_train_cuda_paths.sh"
+
+if ! python -c "
 import jax
 from serl_launcher.agents.continuous.sac import SACAgent
 from robot_controllers_mujoco.configs.insertion_config import make_insertion_config
@@ -94,6 +162,20 @@ env.close()
 print('serl_launcher ok')
 print('robot_controllers_mujoco ok')
 "
+then
+    error "初始自检失败。请优先检查当前 shell 是否通过 .zshrc / ROS / 其他 SDK 全局注入了 /usr/local/cuda* 到 LD_LIBRARY_PATH。"
+fi
+
+if ! python -c "
+import jax
+import jax.numpy as jnp
+x = jnp.ones((1024, 1024), dtype=jnp.float32)
+y = (x @ x).block_until_ready()
+print(jax.devices(), y[0, 0])
+"
+then
+    error "GPU 计算自检失败。请检查激活后的 LD_LIBRARY_PATH 是否仍残留 /usr/local/cuda*，并确认 bundled CUDA 路径已被注入。"
+fi
 
 echo
 info "环境已准备完成。"

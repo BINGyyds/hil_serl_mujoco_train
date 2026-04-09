@@ -1,4 +1,5 @@
 import datetime
+import os
 import tempfile
 from copy import copy
 from socket import gethostname
@@ -62,10 +63,7 @@ class WandBLogger(object):
         if "hostname" not in self._variant:
             self._variant["hostname"] = gethostname()
 
-        if debug:
-            mode = "disabled"
-        else:
-            mode = "online"
+        mode = self._resolve_mode(debug)
 
         self.run = wandb.init(
             config=self._variant,
@@ -92,3 +90,18 @@ class WandBLogger(object):
         data_flat = _recursive_flatten_dict(data)
         data = {k: v for k, v in zip(*data_flat)}
         wandb.log(data, step=step)
+
+    @staticmethod
+    def _resolve_mode(debug: bool) -> str:
+        if debug:
+            return "disabled"
+
+        explicit_mode = os.environ.get("WANDB_MODE")
+        if explicit_mode:
+            return explicit_mode
+
+        api_key = os.environ.get("WANDB_API_KEY") or getattr(wandb.api, "api_key", None)
+        if api_key:
+            return "online"
+
+        return "offline"

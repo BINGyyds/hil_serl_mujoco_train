@@ -1,3 +1,4 @@
+from collections.abc import Mapping
 from typing import Dict, Iterable, Optional, Tuple
 
 import flax
@@ -70,3 +71,38 @@ class EncodingWrapper(nn.Module):
             encoded = jnp.concatenate([encoded, state], axis=-1)
 
         return encoded
+
+
+class StateEncodingWrapper(nn.Module):
+    """
+    Lightweight encoder for state-only observations.
+
+    Accepts either a raw state array or the standard SERL-style observation dict
+    with a ``state`` key, and optionally flattens observation stacking from
+    ``(T, C)``/``(B, T, C)`` into ``(T*C,)``/``(B, T*C)``.
+    """
+
+    enable_stacking: bool = False
+
+    @nn.compact
+    def __call__(
+        self,
+        observations,
+        train: bool = False,
+        stop_gradient: bool = False,
+        is_encoded: bool = False,
+    ) -> jnp.ndarray:
+        del train, stop_gradient, is_encoded
+
+        if isinstance(observations, Mapping):
+            state = observations["state"]
+        else:
+            state = observations
+
+        if self.enable_stacking:
+            if len(state.shape) == 2:
+                state = rearrange(state, "T C -> (T C)")
+            elif len(state.shape) == 3:
+                state = rearrange(state, "B T C -> B (T C)")
+
+        return state

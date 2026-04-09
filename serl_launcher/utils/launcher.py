@@ -14,6 +14,7 @@ from serl_launcher.agents.continuous.bc import BCAgent
 from serl_launcher.agents.continuous.sac import SACAgent
 from serl_launcher.agents.continuous.sac_hybrid_single import SACAgentHybridSingleArm
 from serl_launcher.agents.continuous.sac_hybrid_dual import SACAgentHybridDualArm
+from serl_launcher.common.encoding import StateEncodingWrapper
 from serl_launcher.networks.actor_critic_nets import Critic, Policy, ensemblize
 from serl_launcher.networks.lagrange import GeqLagrangeMultiplier
 from serl_launcher.networks.mlp import MLP
@@ -71,18 +72,19 @@ def make_sac_state_agent(
         "use_layer_norm": True,
         "activate_final": True,
     }
+    state_encoder = StateEncodingWrapper(enable_stacking=True)
 
     critic_backbone = partial(MLP, **network_kwargs)
     critic_backbone = ensemblize(critic_backbone, critic_ensemble_size)(
         name="critic_ensemble"
     )
-    critic_def = partial(Critic, encoder=None, network=critic_backbone)(
+    critic_def = partial(Critic, encoder=state_encoder, network=critic_backbone)(
         name="critic"
     )
 
     action_dim = sample_action.shape[-1]
     policy_def = Policy(
-        encoder=None,
+        encoder=state_encoder,
         network=MLP(**network_kwargs),
         action_dim=action_dim,
         tanh_squash_distribution=True,
