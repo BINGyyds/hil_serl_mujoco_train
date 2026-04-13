@@ -6,7 +6,9 @@ PYTHON_VERSION="${PYTHON_VERSION:-3.11}"
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SIM_REPO_PATH="${ROBOT_CONTROLLERS_MUJOCO_PATH:-}"
 SKIP_APT="${SKIP_APT:-0}"
-CONDA_CHANNEL_ARGS=(--override-channels -c conda-forge -c defaults)
+SKIP_UDEV="${SKIP_UDEV:-0}"
+APT_LOCK_TIMEOUT="${APT_LOCK_TIMEOUT:-300}"
+CONDA_CHANNEL_ARGS=(--override-channels -c conda-forge)
 CONSTRAINTS_FILE="${PROJECT_DIR}/constraints/actor_cpu_py311.txt"
 
 info()  { echo -e "\033[92m[INFO]\033[0m $*"; }
@@ -35,7 +37,7 @@ eval "$($CONDA_BIN shell.bash hook 2>/dev/null)" \
     || eval "$($CONDA_BIN shell.zsh hook 2>/dev/null)" \
     || true
 
-info "Conda 安装将忽略本机 .condarc，自带强制使用官方 channels: conda-forge + defaults"
+info "Conda 安装将忽略本机 .condarc，只使用 conda-forge，避免 defaults channel 的 Anaconda ToS 阻塞"
 
 if [[ -z "$SIM_REPO_PATH" ]]; then
     if [[ -d "$PROJECT_DIR/../sim" ]]; then
@@ -51,11 +53,11 @@ if [[ "$SKIP_APT" == "1" ]]; then
     warn "已设置 SKIP_APT=1，跳过 Ubuntu 系统依赖安装。"
 else
     info "安装 Ubuntu 系统依赖"
-    if ! sudo apt-get update; then
+    if ! sudo apt-get -o DPkg::Lock::Timeout="$APT_LOCK_TIMEOUT" update; then
         error "apt-get update 失败。请先修复系统里的失效源；如果这些系统依赖已经装好，也可以使用 SKIP_APT=1 ./setup_env_actor_ubuntu.sh 跳过此步骤。"
     fi
 
-    sudo apt-get install -y \
+    sudo apt-get -o DPkg::Lock::Timeout="$APT_LOCK_TIMEOUT" install -y \
         build-essential \
         ffmpeg \
         libgl1 \
@@ -65,6 +67,17 @@ else
         libsm6 \
         libxext6 \
         libxrender1
+fi
+
+if [[ "$SKIP_UDEV" == "1" ]]; then
+    warn "已设置 SKIP_UDEV=1，跳过 SpaceMouse udev 规则安装。"
+elif [[ -f "$SIM_REPO_PATH/99-spacemouse.rules" ]]; then
+    info "安装 SpaceMouse udev 规则"
+    sudo install -m 0644 "$SIM_REPO_PATH/99-spacemouse.rules" /etc/udev/rules.d/99-spacemouse.rules
+    sudo udevadm control --reload-rules
+    sudo udevadm trigger --subsystem-match=hidraw || warn "udevadm trigger 失败；请拔插 SpaceMouse 后重试。"
+else
+    warn "未找到 sim/99-spacemouse.rules，跳过 SpaceMouse udev 规则安装。"
 fi
 
 if conda env list | grep -qw "$ENV_NAME"; then
@@ -134,4 +147,4 @@ echo
 info "环境已准备完成。"
 info "激活环境: conda activate $ENV_NAME"
 info "启动 actor: python scripts/train_rlpd_mujoco.py --exp_name mujoco_insertion --actor --ip localhost --checkpoint_path output/mujoco_insertion_actor"
-warn "如需普通用户访问 SpaceMouse，请确保 sim/ 下的 99-spacemouse.rules 已安装。"
+warn "如果 SpaceMouse 已经插着但仍无法打开，请拔插一次设备后重试。"

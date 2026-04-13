@@ -25,15 +25,23 @@ import pickle as pkl
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 if __package__ in (None, ""):
     repo_root = Path(__file__).resolve().parents[1]
     parent_root = Path(__file__).resolve().parents[2]
-    sys.path.insert(0, str(repo_root))
+    repo_root_str = str(repo_root)
+    if repo_root_str in sys.path:
+        sys.path.remove(repo_root_str)
+    sys.path.insert(0, repo_root_str)
+
     for sibling_name in ("sim", "robot_controllers_mujoco"):
         sibling_sim = parent_root / sibling_name
         if sibling_sim.exists():
-            sys.path.insert(0, str(sibling_sim))
+            sibling_sim_str = str(sibling_sim)
+            if sibling_sim_str in sys.path:
+                sys.path.remove(sibling_sim_str)
+            sys.path.insert(1, sibling_sim_str)
 
 import jax
 import jax.numpy as jnp
@@ -79,6 +87,34 @@ sharding = jax.sharding.PositionalSharding(devices)
 
 def print_green(x):
     return print("\033[92m {}\033[00m".format(x))
+
+
+def load_transition_file(path: str) -> list[Any]:
+    """Load a pickle transition list with a clear error for empty demo files."""
+    demo_path = Path(path)
+    if not demo_path.exists():
+        raise FileNotFoundError(f"Demo file does not exist: {demo_path}")
+    if demo_path.stat().st_size == 0:
+        raise ValueError(
+            "Demo file is empty: "
+            f"{demo_path}. Please record successful demos again before training."
+        )
+
+    try:
+        with demo_path.open("rb") as file:
+            transitions = pkl.load(file)
+    except EOFError as exc:
+        raise ValueError(
+            "Demo file is incomplete or corrupted: "
+            f"{demo_path}. Please record successful demos again."
+        ) from exc
+
+    if not isinstance(transitions, list):
+        raise TypeError(
+            f"Demo file must contain a list of transitions, got {type(transitions)!r}: "
+            f"{demo_path}"
+        )
+    return transitions
 
 
 ##############################################################################
@@ -419,10 +455,9 @@ def main(_):
 
         if FLAGS.demo_path is not None:
             for path in FLAGS.demo_path:
-                with open(path, "rb") as f:
-                    transitions = pkl.load(f)
-                    for transition in transitions:
-                        demo_buffer.insert(transition)
+                transitions = load_transition_file(path)
+                for transition in transitions:
+                    demo_buffer.insert(transition)
             print_green(f"demo buffer size: {len(demo_buffer)}")
 
         if FLAGS.checkpoint_path is not None and os.path.exists(

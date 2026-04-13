@@ -99,9 +99,14 @@ python -c "import jax, jax.numpy as jnp; x=jnp.ones((2048,2048), dtype=jnp.float
 
 ## 启动命令
 
+所有训练入口都应从 `train/` 根目录启动，并使用对应 Conda 环境；不要在 `base` 环境里直接运行。
+
 ### learner
 
 ```bash
+cd /home/lrb/Workspace/hil_serl_mujoco/train
+conda activate hil_serl_train
+
 python scripts/train_rlpd_mujoco.py \
   --exp_name mujoco_insertion \
   --learner \
@@ -112,6 +117,9 @@ python scripts/train_rlpd_mujoco.py \
 ### actor
 
 ```bash
+cd /home/lrb/Workspace/hil_serl_mujoco/train
+conda activate hil_serl_actor
+
 python scripts/train_rlpd_mujoco.py \
   --exp_name mujoco_insertion \
   --actor \

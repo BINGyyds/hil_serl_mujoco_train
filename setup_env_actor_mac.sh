@@ -5,6 +5,7 @@ ENV_NAME="${ENV_NAME:-hil_serl_actor}"
 PYTHON_VERSION="${PYTHON_VERSION:-3.11}"
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SIM_REPO_PATH="${ROBOT_CONTROLLERS_MUJOCO_PATH:-}"
+CONDA_CHANNEL_ARGS=(--override-channels -c conda-forge)
 CONSTRAINTS_FILE="${PROJECT_DIR}/constraints/actor_cpu_py311.txt"
 
 info()  { echo -e "\033[92m[INFO]\033[0m $*"; }
@@ -27,6 +28,8 @@ fi
 
 eval "$($CONDA_BIN shell.bash hook 2>/dev/null)" || eval "$($CONDA_BIN shell.zsh hook 2>/dev/null)" || true
 
+info "Conda 安装将忽略本机 .condarc，只使用 conda-forge，避免 defaults channel 的 Anaconda ToS 阻塞"
+
 if [ -z "$SIM_REPO_PATH" ]; then
     if [ -d "$PROJECT_DIR/../sim" ]; then
         SIM_REPO_PATH="$PROJECT_DIR/../sim"
@@ -41,7 +44,7 @@ if conda env list | grep -qw "$ENV_NAME"; then
     warn "Conda 环境 '$ENV_NAME' 已存在，跳过创建。"
 else
     info "创建 Conda 环境: $ENV_NAME"
-    conda create -n "$ENV_NAME" python="$PYTHON_VERSION" -y
+    conda create "${CONDA_CHANNEL_ARGS[@]}" -n "$ENV_NAME" python="$PYTHON_VERSION" -y
 fi
 
 conda activate "$ENV_NAME"
