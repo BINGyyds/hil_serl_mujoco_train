@@ -113,6 +113,8 @@ def make_sac_state_agent(
         backup_entropy=backup_entropy,
         critic_ensemble_size=critic_ensemble_size,
         critic_subsample_size=None,
+        image_keys=(),
+        augmentation_function=None,
     )
     return agent
 

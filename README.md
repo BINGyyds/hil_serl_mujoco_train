@@ -38,6 +38,13 @@ cd /home/lrb/Workspace/hil_serl_mujoco/train
 conda activate hil_serl_actor
 ```
 
+Ubuntu actor 环境会额外尝试安装：
+
+- `pinocchio`
+- `meshcat==0.3.2`
+
+用于可选的 `--actor_viewer meshcat` 轻量网页 viewer。即使这两个依赖安装失败，默认的 MuJoCo viewer 和无窗口模式仍可正常使用。
+
 ### 远端 learner
 
 ```bash
@@ -127,6 +134,31 @@ python scripts/train_rlpd_mujoco.py \
   --checkpoint_path output/mujoco_insertion_actor
 ```
 
+常用变体：
+
+- 无窗口采样：
+
+```bash
+python scripts/train_rlpd_mujoco.py \
+  --exp_name mujoco_insertion \
+  --actor \
+  --ip localhost \
+  --checkpoint_path output/mujoco_insertion_actor \
+  --norender_actor
+```
+
+- 使用 MeshCat 网页 viewer：
+
+```bash
+python scripts/train_rlpd_mujoco.py \
+  --exp_name mujoco_insertion \
+  --actor \
+  --ip localhost \
+  --checkpoint_path output/mujoco_insertion_actor \
+  --actor_viewer meshcat \
+  --actor_render_fps 20
+```
+
 ## W&B 行为
 
 当前默认策略如下：
@@ -164,6 +196,85 @@ Filling up replay buffer: 0/1000
 ```
 
 并不表示程序出错，而是 learner 正在等待 actor 的在线交互数据。
+
+## 本地训练指标与曲线
+
+learner 训练过程中会把 episode 指标持续写到：
+
+```text
+output/.../metrics/episode_metrics.csv
+```
+
+默认字段包括：
+
+- `learner_step`
+- `episode_return`
+- `success`
+- `failure`
+- `xy_error`
+- `z_gap`
+- `rot_error`
+- `insertion_depth`
+- `intervention_count`
+- `intervention_steps`
+
+训练正常结束时会自动尝试生成：
+
+- `reward_curve.png`
+- `success_curve.png`
+- `error_curve.png`
+
+也可以手动重画：
+
+```bash
+cd /home/lrb/Workspace/hil_serl_mujoco/train
+conda activate hil_serl_train
+
+python scripts/plot_mujoco_metrics.py \
+  --metrics_dir /home/lrb/Workspace/hil_serl_mujoco/train/output/mujoco_insertion_local/metrics
+```
+
+如果不想在 learner 退出时自动画图，可以加 `--noplot_metrics_on_exit`。
+
+## Checkpoint Eval 与 MP4 导出
+
+训练后可以直接用 actor 环境加载 checkpoint 做纯策略评估：
+
+```bash
+cd /home/lrb/Workspace/hil_serl_mujoco/train
+conda activate hil_serl_actor
+
+python scripts/train_rlpd_mujoco.py \
+  --exp_name mujoco_insertion \
+  --actor \
+  --checkpoint_path output/mujoco_insertion_local \
+  --eval_checkpoint_step -1 \
+  --eval_n_trajs 10
+```
+
+- `--eval_checkpoint_step -1` 表示加载最新 checkpoint
+- eval 模式会自动关闭 SpaceMouse intervention，不会把人工输入混进结果
+
+如需导出 MP4：
+
+```bash
+python scripts/train_rlpd_mujoco.py \
+  --exp_name mujoco_insertion \
+  --actor \
+  --checkpoint_path output/mujoco_insertion_local \
+  --eval_checkpoint_step -1 \
+  --eval_n_trajs 3 \
+  --actor_viewer none \
+  --eval_video_path output/eval/mujoco_insertion.mp4
+```
+
+说明：
+
+- `--eval_video_width` / `--eval_video_height` 默认 `1280 x 720`
+- `--eval_video_fps` 默认 `30`
+- 默认 eval 相机为 `tool_follow_camera`
+- 如需切回固定前视角，可显式传 `--eval_video_camera front`
+- 如需工具近景，可传 `--eval_video_camera wrist_left_camera`
 
 ## 依赖关系
 

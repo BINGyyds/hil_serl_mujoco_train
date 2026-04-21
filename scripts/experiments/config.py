@@ -4,14 +4,14 @@ from typing import List
 class DefaultTrainingConfig:
     """Default training configuration. """
 
-    agent: str = "drq"
-    max_traj_length: int = 100
+    agent: str = "sac"
+    max_traj_length: int = 500
     batch_size: int = 256
     cta_ratio: int = 2
     discount: float = 0.97
 
-    max_steps: int = 1000000
-    replay_buffer_capacity: int = 200000
+    max_steps: int = 5000000
+    replay_buffer_capacity: int = 5000000
 
     random_steps: int = 0
     training_starts: int = 100
@@ -40,7 +40,13 @@ class DefaultTrainingConfig:
     setup_mode: str = "single-arm-fixed-gripper"
 
     @abstractmethod
-    def get_environment(self, fake_env=False, save_video=False, classifier=False):
+    def get_environment(
+        self,
+        fake_env=False,
+        save_video=False,
+        classifier=False,
+        enable_intervention=True,
+    ):
         raise NotImplementedError
     
     @abstractmethod

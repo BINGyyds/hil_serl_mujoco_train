@@ -19,13 +19,14 @@ Usage:
 from __future__ import annotations
 
 import copy
+import csv
 import glob
 import os
 import pickle as pkl
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional, Tuple
 
 if __package__ in (None, ""):
     repo_root = Path(__file__).resolve().parents[1]
@@ -78,6 +79,51 @@ flags.DEFINE_multi_string("demo_path", None, "Path(s) to the demo data.")
 flags.DEFINE_string("checkpoint_path", None, "Path to save checkpoints.")
 flags.DEFINE_integer("eval_checkpoint_step", 0, "Step to evaluate the checkpoint.")
 flags.DEFINE_integer("eval_n_trajs", 0, "Number of trajectories to evaluate.")
+flags.DEFINE_string(
+    "eval_video_path",
+    None,
+    "Optional MP4 output path for policy eval rollouts.",
+)
+flags.DEFINE_float("eval_video_fps", 30.0, "Eval MP4 frame rate.")
+flags.DEFINE_integer("eval_video_width", 1280, "Eval MP4 frame width.")
+flags.DEFINE_integer("eval_video_height", 720, "Eval MP4 frame height.")
+flags.DEFINE_string(
+    "eval_video_camera",
+    "tool_follow_camera",
+    "Optional MuJoCo camera name for eval MP4. Defaults to tool_follow_camera.",
+)
+flags.DEFINE_boolean("render_actor", True, "Render the MuJoCo actor environment.")
+flags.DEFINE_float(
+    "actor_render_fps",
+    20.0,
+    "Actor viewer refresh rate. Use 0 to disable active viewer refresh.",
+)
+flags.DEFINE_enum(
+    "actor_viewer",
+    "mujoco",
+    ["mujoco", "meshcat", "none"],
+    "Actor viewer backend.",
+)
+flags.DEFINE_integer(
+    "actor_stats_timeout_ms",
+    10000,
+    "Timeout for actor -> learner stats requests.",
+)
+flags.DEFINE_float(
+    "actor_stats_backoff_s",
+    30.0,
+    "Wall-clock backoff after actor stats request failures.",
+)
+flags.DEFINE_string(
+    "metrics_dir",
+    None,
+    "Optional local metrics output directory. Defaults to checkpoint_path/metrics.",
+)
+flags.DEFINE_boolean(
+    "plot_metrics_on_exit",
+    True,
+    "Generate local reward/success/error plots when learner exits normally.",
+)
 flags.DEFINE_boolean("debug", False, "Debug mode (disables wandb logging).")
 
 devices = jax.local_devices()
@@ -117,43 +163,583 @@ def load_transition_file(path: str) -> list[Any]:
     return transitions
 
 
+def resolve_metrics_dir() -> Optional[Path]:
+    """Return the local metrics directory for learner-side CSV/PNG outputs."""
+    if FLAGS.metrics_dir:
+        return Path(FLAGS.metrics_dir).expanduser()
+    if FLAGS.checkpoint_path:
+        return Path(FLAGS.checkpoint_path).expanduser() / "metrics"
+    return None
+
+
+class EpisodeMetricsWriter:
+    """Append actor episode metrics to a local CSV file."""
+
+    FIELDNAMES = (
+        "learner_step",
+        "wall_time",
+        "episode_return",
+        "success",
+        "failure",
+        "xy_error",
+        "z_gap",
+        "rot_error",
+        "insertion_depth",
+        "intervention_count",
+        "intervention_steps",
+    )
+
+    def __init__(self, metrics_dir: Path) -> None:
+        self.metrics_dir = metrics_dir
+        self.metrics_dir.mkdir(parents=True, exist_ok=True)
+        self.csv_path = self.metrics_dir / "episode_metrics.csv"
+        needs_header = not self.csv_path.exists() or self.csv_path.stat().st_size == 0
+        self._file = self.csv_path.open("a", newline="", encoding="utf-8")
+        self._writer = csv.DictWriter(self._file, fieldnames=self.FIELDNAMES)
+        if needs_header:
+            self._writer.writeheader()
+            self._file.flush()
+
+    def write(self, *, learner_step: int, payload: dict) -> bool:
+        environment = payload.get("environment")
+        if not isinstance(environment, dict):
+            return False
+        episode = environment.get("episode")
+        if not isinstance(episode, dict):
+            return False
+
+        row = {
+            "learner_step": int(learner_step),
+            "wall_time": time.time(),
+            "episode_return": episode.get("return", ""),
+            "success": int(bool(environment.get("success", False))),
+            "failure": int(bool(environment.get("failure", False))),
+            "xy_error": environment.get("xy_error", ""),
+            "z_gap": environment.get("z_gap", ""),
+            "rot_error": environment.get("rot_error", ""),
+            "insertion_depth": environment.get("insertion_depth", ""),
+            "intervention_count": episode.get("intervention_count", ""),
+            "intervention_steps": episode.get("intervention_steps", ""),
+        }
+        self._writer.writerow(row)
+        self._file.flush()
+        return True
+
+    def close(self) -> None:
+        self._file.close()
+
+
+def iter_env_chain(env):
+    """Yield an env and its nested Gymnasium wrappers from outer to inner."""
+    current = env
+    seen = set()
+    while current is not None and id(current) not in seen:
+        yield current
+        seen.add(id(current))
+        current = getattr(current, "env", None)
+
+
+def get_raw_env(env):
+    """Return the innermost unwrapped Gymnasium env when available."""
+    return getattr(env, "unwrapped", env)
+
+
+def peek_spacemouse_intervention(env) -> Tuple[Optional[np.ndarray], bool]:
+    """Read one cached SpaceMouse action from the intervention wrapper if present."""
+    for wrapped_env in iter_env_chain(env):
+        peek = getattr(wrapped_env, "peek_intervention", None)
+        if callable(peek):
+            action, intervened = peek()
+            return np.asarray(action, dtype=np.float64), bool(intervened)
+    return None, False
+
+
+class ActorRenderManager:
+    """Throttle actor visualization so rendering does not set the control rate."""
+
+    def __init__(
+        self,
+        env,
+        *,
+        enabled: bool,
+        viewer: str,
+        fps: float,
+    ) -> None:
+        if fps < 0.0:
+            raise ValueError("--actor_render_fps must be non-negative.")
+
+        self.env = env
+        self.viewer = viewer
+        self.interval = 1.0 / fps if fps > 0.0 else np.inf
+        self.next_render_time = 0.0
+        self.enabled = bool(enabled) and viewer != "none" and fps > 0.0
+        self._meshcat = None
+        self._meshcat_geometry = None
+        self._raw_env = None
+        self._meshcat_geom_paths = []
+        self._meshcat_site_paths = []
+
+        if self.enabled and self.viewer == "meshcat":
+            self._setup_meshcat()
+
+    def maybe_render(self, *, force: bool = False) -> None:
+        if not self.enabled:
+            return
+
+        now = time.perf_counter()
+        if not force and now < self.next_render_time:
+            return
+
+        if self.viewer == "mujoco":
+            self.env.render()
+        elif self.viewer == "meshcat":
+            self._render_meshcat()
+
+        self.next_render_time = now + self.interval
+
+    def _setup_meshcat(self) -> None:
+        try:
+            from importlib import metadata as importlib_metadata
+
+            importlib_metadata.version("typing")
+        except importlib_metadata.PackageNotFoundError:
+            pass
+        else:
+            raise RuntimeError(
+                "--actor_viewer=meshcat cannot run while the Python 2/3 "
+                "`typing` backport package is installed in Python 3.11. "
+                "Run `python -m pip uninstall -y typing` in the actor environment."
+            )
+
+        try:
+            import meshcat
+            import meshcat.geometry as geometry
+        except ImportError as exc:
+            raise RuntimeError(
+                "--actor_viewer=meshcat requires meshcat. "
+                "Install it in the actor environment with `python -m pip install meshcat`."
+            ) from exc
+
+        raw_env = get_raw_env(self.env)
+        if not hasattr(raw_env, "model") or not hasattr(raw_env, "data"):
+            raise RuntimeError(
+                "--actor_viewer=meshcat requires a MuJoCo env exposing model/data."
+            )
+
+        self._raw_env = raw_env
+        self._meshcat_geometry = geometry
+        self._meshcat = meshcat.Visualizer()
+        self._meshcat.open()
+        self._meshcat.delete()
+        self._load_mujoco_visual_geoms()
+
+    def _render_meshcat(self) -> None:
+        if self._meshcat is None or self._raw_env is None:
+            return
+
+        for path, geom_id, correction in self._meshcat_geom_paths:
+            self._meshcat[path].set_transform(
+                self._geom_transform(geom_id) @ correction
+            )
+        for path, site_id, correction in self._meshcat_site_paths:
+            self._meshcat[path].set_transform(
+                self._site_transform(site_id) @ correction
+            )
+
+    def _load_mujoco_visual_geoms(self) -> None:
+        import mujoco
+
+        model = self._raw_env.model
+        geometry = self._meshcat_geometry
+        self._meshcat_geom_paths = []
+        self._meshcat_site_paths = []
+
+        for geom_id in range(model.ngeom):
+            if int(model.geom_group[geom_id]) != 2:
+                continue
+            if model.geom_rgba[geom_id, 3] <= 0.0:
+                continue
+
+            geom_type = int(model.geom_type[geom_id])
+            if geom_type in (
+                int(mujoco.mjtGeom.mjGEOM_PLANE),
+                int(mujoco.mjtGeom.mjGEOM_HFIELD),
+                int(mujoco.mjtGeom.mjGEOM_SDF),
+            ):
+                continue
+
+            meshcat_geom, correction = self._meshcat_geometry_for_mujoco_geom(
+                geom_id
+            )
+            if meshcat_geom is None:
+                continue
+
+            material = self._meshcat_material_for_mujoco_geom(geom_id)
+            geom_name = mujoco.mj_id2name(
+                model,
+                mujoco.mjtObj.mjOBJ_GEOM,
+                geom_id,
+            )
+            path = f"mujoco/geoms/{geom_id:03d}_{geom_name or 'geom'}"
+            self._meshcat[path].set_object(meshcat_geom, material)
+            self._meshcat[path].set_transform(
+                self._geom_transform(geom_id) @ correction
+            )
+            self._meshcat_geom_paths.append((path, geom_id, correction))
+
+        self._meshcat["world/tool_tip"].set_object(
+            geometry.Sphere(0.004),
+            geometry.MeshLambertMaterial(color=0x00CC44),
+        )
+        self._meshcat["world/socket"].set_object(
+            geometry.Sphere(0.005),
+            geometry.MeshLambertMaterial(color=0xCC2222),
+        )
+        self._meshcat_site_paths.extend(
+            [
+                (
+                    "world/tool_tip",
+                    self._raw_env._ee_site_id,
+                    np.eye(4, dtype=np.float64),
+                ),
+                (
+                    "world/socket",
+                    self._raw_env._socket_site_id,
+                    np.eye(4, dtype=np.float64),
+                ),
+            ]
+        )
+
+        print_green(
+            "MeshCat loaded "
+            f"{len(self._meshcat_geom_paths)} MuJoCo visual geoms and "
+            f"{len(self._meshcat_site_paths)} site markers."
+        )
+
+    def _meshcat_geometry_for_mujoco_geom(self, geom_id: int):
+        import mujoco
+
+        model = self._raw_env.model
+        geometry = self._meshcat_geometry
+        geom_type = int(model.geom_type[geom_id])
+        size = np.asarray(model.geom_size[geom_id], dtype=np.float64)
+        correction = np.eye(4, dtype=np.float64)
+
+        if geom_type == int(mujoco.mjtGeom.mjGEOM_MESH):
+            mesh_id = int(model.geom_dataid[geom_id])
+            if mesh_id < 0:
+                return None, correction
+
+            vert_adr = int(model.mesh_vertadr[mesh_id])
+            vert_num = int(model.mesh_vertnum[mesh_id])
+            face_adr = int(model.mesh_faceadr[mesh_id])
+            face_num = int(model.mesh_facenum[mesh_id])
+            vertices = np.asarray(
+                model.mesh_vert[vert_adr : vert_adr + vert_num],
+                dtype=np.float32,
+            ).copy()
+            faces = np.asarray(
+                model.mesh_face[face_adr : face_adr + face_num],
+                dtype=np.uint32,
+            ).copy()
+            return geometry.TriangularMeshGeometry(vertices, faces), correction
+
+        if geom_type == int(mujoco.mjtGeom.mjGEOM_BOX):
+            return geometry.Box(2.0 * size[:3]), correction
+
+        if geom_type == int(mujoco.mjtGeom.mjGEOM_SPHERE):
+            return geometry.Sphere(float(size[0])), correction
+
+        if geom_type in (
+            int(mujoco.mjtGeom.mjGEOM_CYLINDER),
+            int(mujoco.mjtGeom.mjGEOM_CAPSULE),
+        ):
+            correction[:3, :3] = np.array(
+                [
+                    [1.0, 0.0, 0.0],
+                    [0.0, 0.0, -1.0],
+                    [0.0, 1.0, 0.0],
+                ],
+                dtype=np.float64,
+            )
+            return geometry.Cylinder(2.0 * float(size[1]), float(size[0])), correction
+
+        return None, correction
+
+    def _meshcat_material_for_mujoco_geom(self, geom_id: int):
+        model = self._raw_env.model
+        material_id = int(model.geom_matid[geom_id])
+        if material_id >= 0:
+            rgba = model.mat_rgba[material_id]
+        else:
+            rgba = model.geom_rgba[geom_id]
+        rgba = np.clip(rgba, 0.0, 1.0)
+        rgb = (255.0 * rgba[:3]).astype(int)
+        color = int(rgb[0] << 16 | rgb[1] << 8 | rgb[2])
+        return self._meshcat_geometry.MeshLambertMaterial(
+            color=color,
+            transparent=bool(rgba[3] < 1.0),
+            opacity=float(rgba[3]),
+        )
+
+    def _geom_transform(self, geom_id: int) -> np.ndarray:
+        transform = np.eye(4, dtype=np.float64)
+        transform[:3, :3] = self._raw_env.data.geom_xmat[geom_id].reshape(3, 3)
+        transform[:3, 3] = self._raw_env.data.geom_xpos[geom_id]
+        return transform
+
+    def _site_transform(self, site_id: int) -> np.ndarray:
+        transform = np.eye(4, dtype=np.float64)
+        transform[:3, :3] = self._raw_env.data.site_xmat[site_id].reshape(3, 3)
+        transform[:3, 3] = self._raw_env.data.site_xpos[site_id]
+        return transform
+
+
+class EvalVideoRecorder:
+    """Record MuJoCo RGB frames during checkpoint eval rollouts."""
+
+    def __init__(
+        self,
+        env,
+        *,
+        output_path: Optional[str],
+        num_episodes: int,
+        fps: float,
+        width: int,
+        height: int,
+        camera: Optional[str],
+    ) -> None:
+        self.enabled = bool(output_path)
+        self._writer = None
+        self._renderer = None
+        self._imageio = None
+        self._active_path: Optional[Path] = None
+        self._next_frame_time = 0.0
+        self._frame_interval = 0.0
+        self._last_frame_time: Optional[float] = None
+
+        if not self.enabled:
+            return
+
+        if fps <= 0.0:
+            raise ValueError("--eval_video_fps must be positive.")
+        if width <= 0 or height <= 0:
+            raise ValueError(
+                "--eval_video_width and --eval_video_height must be positive."
+            )
+
+        raw_env = get_raw_env(env)
+        if not hasattr(raw_env, "model") or not hasattr(raw_env, "data"):
+            raise RuntimeError(
+                "--eval_video_path requires a MuJoCo env exposing model/data."
+            )
+
+        try:
+            import imageio.v2 as imageio
+        except ImportError as exc:
+            raise RuntimeError(
+                "--eval_video_path requires imageio and imageio-ffmpeg. "
+                "Install them with `python -m pip install imageio imageio-ffmpeg`."
+            ) from exc
+
+        import mujoco
+
+        base_path = Path(str(output_path)).expanduser()
+        if base_path.suffix and base_path.suffix.lower() != ".mp4":
+            raise ValueError("--eval_video_path must be an .mp4 file or a directory.")
+
+        self.raw_env = raw_env
+        self.base_path = base_path
+        self.num_episodes = num_episodes
+        self.fps = float(fps)
+        self.width = int(width)
+        self.height = int(height)
+        self.camera = camera or getattr(
+            getattr(raw_env, "cfg", None),
+            "render_camera",
+            None,
+        )
+        self._frame_interval = 1.0 / self.fps
+        self._imageio = imageio
+        try:
+            self._renderer = mujoco.Renderer(raw_env.model, self.height, self.width)
+        except Exception as exc:
+            raise RuntimeError(
+                "Failed to create the MuJoCo offscreen renderer for eval video. "
+                "If this is a headless session, start the command with "
+                "`MUJOCO_GL=egl` or `MUJOCO_GL=osmesa`."
+            ) from exc
+
+    def start_episode(self, episode_idx: int) -> None:
+        if not self.enabled:
+            return
+
+        self.finish_episode()
+        path = self._episode_path(episode_idx)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            self._writer = self._imageio.get_writer(
+                str(path),
+                fps=self.fps,
+                codec="libx264",
+                quality=8,
+                macro_block_size=1,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "Failed to create MP4 writer. Make sure imageio-ffmpeg is installed: "
+                "`python -m pip install imageio-ffmpeg`."
+            ) from exc
+
+        self._active_path = path
+        self._last_frame_time = None
+        self._next_frame_time = float(self.raw_env.data.time)
+        self.capture(force=True)
+
+    def maybe_capture(self) -> None:
+        self.capture(force=False)
+
+    def capture(self, *, force: bool = False) -> None:
+        if not self.enabled or self._writer is None:
+            return
+
+        sim_time = float(self.raw_env.data.time)
+        if not force and sim_time + 1e-12 < self._next_frame_time:
+            return
+        if force and self._last_frame_time is not None:
+            if abs(sim_time - self._last_frame_time) < 1e-12:
+                return
+
+        self._renderer.update_scene(self.raw_env.data, camera=self.camera)
+        self._writer.append_data(self._renderer.render())
+        self._last_frame_time = sim_time
+
+        if force:
+            self._next_frame_time = sim_time + self._frame_interval
+            return
+
+        while self._next_frame_time <= sim_time + 1e-12:
+            self._next_frame_time += self._frame_interval
+
+    def finish_episode(self) -> None:
+        if self._writer is None:
+            return
+
+        try:
+            self.capture(force=True)
+        finally:
+            self._writer.close()
+            self._writer = None
+            if self._active_path is not None:
+                print_green(f"Saved eval video: {self._active_path}")
+            self._active_path = None
+
+    def close(self) -> None:
+        self.finish_episode()
+        if self._renderer is not None:
+            self._renderer.close()
+            self._renderer = None
+
+    def _episode_path(self, episode_idx: int) -> Path:
+        if self.base_path.exists() and self.base_path.is_dir():
+            return self.base_path / f"episode_{episode_idx + 1:03d}.mp4"
+        if not self.base_path.suffix:
+            return self.base_path / f"episode_{episode_idx + 1:03d}.mp4"
+        if self.num_episodes == 1:
+            return self.base_path
+        return self.base_path.with_name(
+            f"{self.base_path.stem}_ep{episode_idx + 1:03d}{self.base_path.suffix}"
+        )
+
+
 ##############################################################################
 
 
 def actor(agent, data_store, intvn_data_store, env, sampling_rng):
     """Actor loop: steps the environment, optionally records SpaceMouse interventions."""
+    renderer = ActorRenderManager(
+        env,
+        enabled=FLAGS.render_actor,
+        viewer=FLAGS.actor_viewer,
+        fps=FLAGS.actor_render_fps,
+    )
+
     if FLAGS.eval_checkpoint_step:
+        if FLAGS.eval_checkpoint_step < -1:
+            raise ValueError(
+                "--eval_checkpoint_step must be positive, 0 to disable eval, "
+                "or -1 to load the latest checkpoint."
+            )
+        if FLAGS.eval_n_trajs <= 0:
+            raise ValueError("--eval_n_trajs must be positive when running eval.")
+        if FLAGS.checkpoint_path is None:
+            raise ValueError("--checkpoint_path is required when running eval.")
+
         success_counter = 0
         time_list = []
+        checkpoint_dir = os.path.abspath(FLAGS.checkpoint_path)
+        checkpoint_step = (
+            None if FLAGS.eval_checkpoint_step == -1 else FLAGS.eval_checkpoint_step
+        )
+        if checkpoint_step is None:
+            latest = checkpoints.latest_checkpoint(checkpoint_dir)
+            if latest is None:
+                raise FileNotFoundError(
+                    f"No checkpoint found in checkpoint_path={checkpoint_dir!r}."
+                )
+            print_green(f"Loading latest checkpoint: {latest}")
+        else:
+            print_green(
+                f"Loading checkpoint step {checkpoint_step} from {checkpoint_dir}"
+            )
+
         ckpt = checkpoints.restore_checkpoint(
-            os.path.abspath(FLAGS.checkpoint_path),
+            checkpoint_dir,
             agent.state,
-            step=FLAGS.eval_checkpoint_step,
+            step=checkpoint_step,
         )
         agent = agent.replace(state=ckpt)
 
-        for episode in range(FLAGS.eval_n_trajs):
-            obs, _ = env.reset()
-            done = False
-            start_time = time.time()
-            while not done:
-                sampling_rng, key = jax.random.split(sampling_rng)
-                actions = agent.sample_actions(
-                    observations=jax.device_put(obs),
-                    argmax=True,
-                    seed=key,
-                )
-                actions = np.asarray(jax.device_get(actions))
-                next_obs, reward, done, truncated, info = env.step(actions)
-                obs = next_obs
-                done = done or truncated
-                if done and info.get("success", False):
-                    dt = time.time() - start_time
-                    time_list.append(dt)
-                    success_counter += 1
+        video_recorder = EvalVideoRecorder(
+            env,
+            output_path=FLAGS.eval_video_path,
+            num_episodes=FLAGS.eval_n_trajs,
+            fps=FLAGS.eval_video_fps,
+            width=FLAGS.eval_video_width,
+            height=FLAGS.eval_video_height,
+            camera=FLAGS.eval_video_camera,
+        )
 
-            print(f"Episode {episode + 1}: success={info.get('success', False)}")
-            print(f"  running success rate: {success_counter}/{episode + 1}")
+        try:
+            for episode in range(FLAGS.eval_n_trajs):
+                obs, _ = env.reset()
+                video_recorder.start_episode(episode)
+                renderer.maybe_render(force=True)
+                done = False
+                start_time = time.time()
+                while not done:
+                    sampling_rng, key = jax.random.split(sampling_rng)
+                    actions = agent.sample_actions(
+                        observations=jax.device_put(obs),
+                        argmax=True,
+                        seed=key,
+                    )
+                    actions = np.asarray(jax.device_get(actions))
+                    next_obs, reward, done, truncated, info = env.step(actions)
+                    renderer.maybe_render()
+                    video_recorder.maybe_capture()
+                    obs = next_obs
+                    done = done or truncated
+                    if done and info.get("success", False):
+                        dt = time.time() - start_time
+                        time_list.append(dt)
+                        success_counter += 1
+
+                video_recorder.finish_episode()
+                print(f"Episode {episode + 1}: success={info.get('success', False)}")
+                print(f"  running success rate: {success_counter}/{episode + 1}")
+        finally:
+            video_recorder.close()
 
         print(f"Final success rate: {success_counter / FLAGS.eval_n_trajs}")
         if time_list:
@@ -179,7 +765,7 @@ def actor(agent, data_store, intvn_data_store, env, sampling_rng):
         make_trainer_config(),
         data_stores=datastore_dict,
         wait_for_server=True,
-        timeout_ms=3000,
+        timeout_ms=FLAGS.actor_stats_timeout_ms,
     )
 
     def update_params(params):
@@ -192,19 +778,45 @@ def actor(agent, data_store, intvn_data_store, env, sampling_rng):
     demo_transitions = []
 
     obs, _ = env.reset()
+    renderer.maybe_render(force=True)
     done = False
     timer = Timer()
     running_return = 0.0
     already_intervened = False
     intervention_count = 0
     intervention_steps = 0
+    stats_backoff_until = 0.0
+    last_stats_warning_time = 0.0
+
+    def safe_send_stats(stats: dict, *, label: str) -> bool:
+        nonlocal stats_backoff_until, last_stats_warning_time
+        now = time.monotonic()
+        if now < stats_backoff_until:
+            return False
+        try:
+            client.request("send-stats", stats)
+            stats_backoff_until = 0.0
+            return True
+        except Exception as exc:
+            stats_backoff_until = now + max(FLAGS.actor_stats_backoff_s, 0.0)
+            if now - last_stats_warning_time >= max(FLAGS.actor_stats_backoff_s, 1.0):
+                print(
+                    f"[WARN] actor failed to send {label} stats to learner: {exc}. "
+                    f"Backing off for {FLAGS.actor_stats_backoff_s:.1f}s.",
+                    flush=True,
+                )
+                last_stats_warning_time = now
+            return False
 
     pbar = tqdm.tqdm(range(start_step, config.max_steps), dynamic_ncols=True)
     for step in pbar:
         timer.tick("total")
+        intervention_action, intervention_requested = peek_spacemouse_intervention(env)
 
         with timer.context("sample_actions"):
-            if step < config.random_steps:
+            if intervention_requested:
+                actions = intervention_action
+            elif step < config.random_steps:
                 actions = env.action_space.sample()
             else:
                 sampling_rng, key = jax.random.split(sampling_rng)
@@ -217,6 +829,7 @@ def actor(agent, data_store, intvn_data_store, env, sampling_rng):
 
         with timer.context("step_env"):
             next_obs, reward, done, truncated, info = env.step(actions)
+            renderer.maybe_render()
             if "left" in info:
                 info.pop("left")
             if "right" in info:
@@ -253,14 +866,22 @@ def actor(agent, data_store, intvn_data_store, env, sampling_rng):
                 info["episode"]["intervention_steps"] = intervention_steps
                 info["episode"]["return"] = running_return
                 stats = {"environment": info}
-                client.request("send-stats", stats)
+                episode_stats_sent = safe_send_stats(stats, label="episode")
                 pbar.set_description(f"return: {running_return:.1f}")
                 running_return = 0.0
                 intervention_count = 0
                 intervention_steps = 0
                 already_intervened = False
-                client.update()
+                if episode_stats_sent:
+                    try:
+                        client.update()
+                    except Exception as exc:
+                        print(
+                            f"[WARN] actor failed to update network from learner: {exc}",
+                            flush=True,
+                        )
                 obs, _ = env.reset()
+                renderer.maybe_render(force=True)
 
         if step > 0 and config.buffer_period > 0 and step % config.buffer_period == 0:
             buffer_path = os.path.join(FLAGS.checkpoint_path, "buffer")
@@ -280,7 +901,7 @@ def actor(agent, data_store, intvn_data_store, env, sampling_rng):
 
         if step % config.log_period == 0:
             stats = {"timer": timer.get_average_times()}
-            client.request("send-stats", stats)
+            safe_send_stats(stats, label="timer")
 
 
 ##############################################################################
@@ -295,11 +916,23 @@ def learner(rng, agent, replay_buffer, demo_buffer, wandb_logger=None):
             start_step = int(os.path.basename(latest)[11:]) + 1
 
     step = start_step
+    metrics_dir = resolve_metrics_dir()
+    metrics_writer = None
+    if metrics_dir is None:
+        print_green(
+            "Local episode metrics disabled: set --checkpoint_path or --metrics_dir "
+            "to save reward curves."
+        )
+    else:
+        metrics_writer = EpisodeMetricsWriter(metrics_dir)
+        print_green(f"Writing local episode metrics to {metrics_writer.csv_path}")
 
     def stats_callback(type: str, payload: dict) -> dict:
         assert type == "send-stats", f"Invalid request type: {type}"
         if wandb_logger is not None:
             wandb_logger.log(payload, step=step)
+        if metrics_writer is not None:
+            metrics_writer.write(learner_step=step, payload=payload)
         return {}
 
     server = TrainerServer(make_trainer_config(), request_callback=stats_callback)
@@ -385,6 +1018,16 @@ def learner(rng, agent, replay_buffer, demo_buffer, wandb_logger=None):
                 keep=20,
             )
 
+    if metrics_writer is not None:
+        metrics_writer.close()
+        if FLAGS.plot_metrics_on_exit:
+            try:
+                from scripts.plot_mujoco_metrics import plot_metrics
+
+                plot_metrics(metrics_dir=metrics_dir, window=20)
+            except Exception as exc:
+                print(f"Failed to plot local metrics: {exc}")
+
 
 ##############################################################################
 
@@ -405,6 +1048,7 @@ def main(_):
         fake_env=FLAGS.learner,
         save_video=False,
         classifier=config.use_reward_classifier,
+        enable_intervention=not bool(FLAGS.eval_checkpoint_step),
     )
     env = RecordEpisodeStatistics(env)
 

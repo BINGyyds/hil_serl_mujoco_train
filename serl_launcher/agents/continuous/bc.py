@@ -23,7 +23,7 @@ class BCAgent(flax.struct.PyTreeNode):
     config: dict = nonpytree_field()
 
     def data_augmentation_fn(self, rng, observations):
-        for pixel_key in self.config["image_keys"]:
+        for pixel_key in self.config.get("image_keys") or ():
             observations = observations.copy(
                 add_or_replace={
                     pixel_key: batched_random_crop(
@@ -35,7 +35,8 @@ class BCAgent(flax.struct.PyTreeNode):
 
     @partial(jax.jit, static_argnames="pmap_axis")
     def update(self, batch: Batch, pmap_axis: str = None):
-        if self.config["image_keys"][0] not in batch["next_observations"]:
+        image_keys = self.config.get("image_keys") or ()
+        if image_keys and image_keys[0] not in batch["next_observations"]:
             batch = _unpack(batch)
 
         rng, aug_rng = jax.random.split(self.state.rng)

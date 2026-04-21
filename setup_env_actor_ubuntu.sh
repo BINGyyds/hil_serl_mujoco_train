@@ -129,6 +129,14 @@ python -m pip uninstall -y \
 info "安装 actor 精确约束版本（CPU JAX 0.6.2）"
 python -m pip install --upgrade --force-reinstall -r "$CONSTRAINTS_FILE"
 
+info "安装可选轻量网页 viewer 依赖（Pinocchio + MeshCat）"
+conda install "${CONDA_CHANNEL_ARGS[@]}" -n "$ENV_NAME" pinocchio -y \
+    || warn "Pinocchio 安装失败；--actor_viewer meshcat 将不可用。"
+python -m pip install meshcat==0.3.2 \
+    || warn "MeshCat 安装失败；--actor_viewer meshcat 将不可用。"
+python -m pip uninstall -y typing \
+    || true
+
 python -c "
 import jax
 from robot_controllers_mujoco.configs.insertion_config import make_insertion_config

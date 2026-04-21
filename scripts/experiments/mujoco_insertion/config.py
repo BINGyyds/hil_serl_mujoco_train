@@ -29,13 +29,13 @@ class TrainConfig(DefaultTrainingConfig):
     encoder_type = "none"
     use_reward_classifier = False
 
-    max_traj_length = 200
+    max_traj_length = 1000
     batch_size = 256
     discount = 0.99
     cta_ratio = 2
 
-    max_steps = 200_000
-    replay_buffer_capacity = 200_000
+    max_steps = 5_000_000
+    replay_buffer_capacity = 5_000_000
     training_starts = 1000
     random_steps = 1000
     steps_per_update = 10
@@ -44,13 +44,19 @@ class TrainConfig(DefaultTrainingConfig):
     checkpoint_period = 5000
     buffer_period = 1000
 
-    def get_environment(self, fake_env=False, save_video=False, classifier=False):
+    def get_environment(
+        self,
+        fake_env=False,
+        save_video=False,
+        classifier=False,
+        enable_intervention=True,
+    ):
         cfg = make_insertion_config()
         env = FrankaInsertionEnv(
             config=cfg,
             render_mode="human" if not fake_env else None,
         )
-        if not fake_env:
+        if enable_intervention and not fake_env:
             env = MujocoSpacemouseIntervention(env)
         env = MujocoSERLObsWrapper(env, proprio_keys=self.proprio_keys)
         env = ChunkingWrapper(env, obs_horizon=1, act_exec_horizon=None)
