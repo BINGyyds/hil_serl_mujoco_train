@@ -131,8 +131,14 @@ python scripts/train_rlpd_mujoco.py \
   --exp_name mujoco_insertion \
   --actor \
   --ip localhost \
-  --checkpoint_path output/mujoco_insertion_actor
+  --checkpoint_path output/mujoco_insertion_actor \
+  --actor_viewer meshcat \
+  --actor_render_fps 20
 ```
+
+如果只想切回原始 MuJoCo viewer，去掉 `--actor_viewer meshcat --actor_render_fps 20` 即可。
+
+actor 默认会在达到自身 `max_steps` 后继续采样，直到 learner 回报训练完成，避免 learner 后半段只用冻结 replay buffer 继续训练。若需要恢复旧的固定 actor 步数行为，可加 `--noactor_run_until_learner_done`。
 
 常用变体：
 

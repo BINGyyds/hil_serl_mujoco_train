@@ -114,6 +114,17 @@ flags.DEFINE_float(
     30.0,
     "Wall-clock backoff after actor stats request failures.",
 )
+flags.DEFINE_boolean(
+    "actor_run_until_learner_done",
+    True,
+    "Keep actor sampling past config.max_steps until the learner reports done.",
+)
+flags.DEFINE_float(
+    "learner_done_grace_s",
+    60.0,
+    "Seconds for the learner request server to stay alive after training ends, "
+    "so actors can receive learner_done=True and exit cleanly.",
+)
 flags.DEFINE_string(
     "metrics_dir",
     None,
@@ -787,15 +798,18 @@ def actor(agent, data_store, intvn_data_store, env, sampling_rng):
     intervention_steps = 0
     stats_backoff_until = 0.0
     last_stats_warning_time = 0.0
+    learner_done = False
 
     def safe_send_stats(stats: dict, *, label: str) -> bool:
-        nonlocal stats_backoff_until, last_stats_warning_time
+        nonlocal stats_backoff_until, last_stats_warning_time, learner_done
         now = time.monotonic()
         if now < stats_backoff_until:
             return False
         try:
-            client.request("send-stats", stats)
+            response = client.request("send-stats", stats)
             stats_backoff_until = 0.0
+            if isinstance(response, dict):
+                learner_done = bool(response.get("learner_done", False))
             return True
         except Exception as exc:
             stats_backoff_until = now + max(FLAGS.actor_stats_backoff_s, 0.0)
@@ -808,8 +822,24 @@ def actor(agent, data_store, intvn_data_store, env, sampling_rng):
                 last_stats_warning_time = now
             return False
 
-    pbar = tqdm.tqdm(range(start_step, config.max_steps), dynamic_ncols=True)
-    for step in pbar:
+    pbar_total = config.max_steps if not FLAGS.actor_run_until_learner_done else None
+    pbar = tqdm.tqdm(
+        total=pbar_total,
+        initial=start_step if pbar_total is not None else 0,
+        dynamic_ncols=True,
+    )
+    step = start_step
+    while True:
+        if not FLAGS.actor_run_until_learner_done and step >= config.max_steps:
+            break
+        if (
+            FLAGS.actor_run_until_learner_done
+            and step >= config.max_steps
+            and learner_done
+        ):
+            print_green("actor reached max_steps and learner reports done; exiting.")
+            break
+
         timer.tick("total")
         intervention_action, intervention_requested = peek_spacemouse_intervention(env)
 
@@ -901,7 +931,36 @@ def actor(agent, data_store, intvn_data_store, env, sampling_rng):
 
         if step % config.log_period == 0:
             stats = {"timer": timer.get_average_times()}
-            safe_send_stats(stats, label="timer")
+            timer_stats_sent = safe_send_stats(stats, label="timer")
+            if (
+                FLAGS.actor_run_until_learner_done
+                and step >= config.max_steps
+                and learner_done
+            ):
+                print_green("actor received learner_done=True; exiting.")
+                break
+            if (
+                FLAGS.actor_run_until_learner_done
+                and step >= config.max_steps
+                and not timer_stats_sent
+            ):
+                print_green(
+                    "actor reached max_steps and learner is unavailable; exiting."
+                )
+                break
+
+        if (
+            FLAGS.actor_run_until_learner_done
+            and step >= config.max_steps
+            and learner_done
+        ):
+            print_green("actor received learner_done=True; exiting.")
+            break
+
+        step += 1
+        pbar.update(1)
+
+    pbar.close()
 
 
 ##############################################################################
@@ -927,13 +986,19 @@ def learner(rng, agent, replay_buffer, demo_buffer, wandb_logger=None):
         metrics_writer = EpisodeMetricsWriter(metrics_dir)
         print_green(f"Writing local episode metrics to {metrics_writer.csv_path}")
 
+    learner_done = False
+
     def stats_callback(type: str, payload: dict) -> dict:
         assert type == "send-stats", f"Invalid request type: {type}"
         if wandb_logger is not None:
             wandb_logger.log(payload, step=step)
         if metrics_writer is not None:
             metrics_writer.write(learner_step=step, payload=payload)
-        return {}
+        return {
+            "learner_done": learner_done,
+            "learner_step": int(step),
+            "learner_max_steps": int(config.max_steps),
+        }
 
     server = TrainerServer(make_trainer_config(), request_callback=stats_callback)
     server.register_data_store("actor_env", replay_buffer)
@@ -1017,6 +1082,15 @@ def learner(rng, agent, replay_buffer, demo_buffer, wandb_logger=None):
                 step=step,
                 keep=20,
             )
+
+    learner_done = True
+    grace_s = max(float(FLAGS.learner_done_grace_s), 0.0)
+    if grace_s > 0.0:
+        print_green(
+            f"learner finished; keeping request server alive for {grace_s:.1f}s "
+            "so actors can exit cleanly."
+        )
+        time.sleep(grace_s)
 
     if metrics_writer is not None:
         metrics_writer.close()
