@@ -260,6 +260,13 @@ python scripts/train_rlpd_mujoco.py \
 
 - `--eval_checkpoint_step -1` 表示加载最新 checkpoint
 - eval 模式会自动关闭 SpaceMouse intervention，不会把人工输入混进结果
+- eval 终端会打印每条 episode 的：
+  - `steps`
+  - `success_sim_time`
+  - `success_wall_time`
+- 汇总默认关注 `Average simulated success time`
+- 如需按 1x 实时观察策略动作，可加：
+  - `--eval_realtime_factor 1.0`
 
 如需导出 MP4：
 
@@ -281,6 +288,8 @@ python scripts/train_rlpd_mujoco.py \
 - 默认 eval 相机为 `tool_follow_camera`
 - 如需切回固定前视角，可显式传 `--eval_video_camera front`
 - 如需工具近景，可传 `--eval_video_camera wrist_left_camera`
+- 无论 `--eval_n_trajs` 取多少，当前都会将所有 eval episode 顺序拼接到一个总 MP4 中
+- 如需按 1x 实时播放再录制，可加 `--eval_realtime_factor 1.0`
 
 ## 依赖关系
 

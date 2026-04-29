@@ -79,6 +79,13 @@ flags.DEFINE_multi_string("demo_path", None, "Path(s) to the demo data.")
 flags.DEFINE_string("checkpoint_path", None, "Path to save checkpoints.")
 flags.DEFINE_integer("eval_checkpoint_step", 0, "Step to evaluate the checkpoint.")
 flags.DEFINE_integer("eval_n_trajs", 0, "Number of trajectories to evaluate.")
+flags.DEFINE_float(
+    "eval_realtime_factor",
+    0.0,
+    "Eval playback speed relative to MuJoCo simulated time. "
+    "0 disables sleeps, 1.0 is realtime, >1.0 is slower-than-realtime, "
+    "and 0<factor<1.0 is faster-than-realtime with throttling.",
+)
 flags.DEFINE_string(
     "eval_video_path",
     None,
@@ -585,24 +592,24 @@ class EvalVideoRecorder:
         if not self.enabled:
             return
 
-        self.finish_episode()
-        path = self._episode_path(episode_idx)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            self._writer = self._imageio.get_writer(
-                str(path),
-                fps=self.fps,
-                codec="libx264",
-                quality=8,
-                macro_block_size=1,
-            )
-        except Exception as exc:
-            raise RuntimeError(
-                "Failed to create MP4 writer. Make sure imageio-ffmpeg is installed: "
-                "`python -m pip install imageio-ffmpeg`."
-            ) from exc
+        if self._writer is None:
+            path = self._output_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                self._writer = self._imageio.get_writer(
+                    str(path),
+                    fps=self.fps,
+                    codec="libx264",
+                    quality=8,
+                    macro_block_size=1,
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    "Failed to create MP4 writer. Make sure imageio-ffmpeg is installed: "
+                    "`python -m pip install imageio-ffmpeg`."
+                ) from exc
+            self._active_path = path
 
-        self._active_path = path
         self._last_frame_time = None
         self._next_frame_time = float(self.raw_env.data.time)
         self.capture(force=True)
@@ -636,31 +643,28 @@ class EvalVideoRecorder:
         if self._writer is None:
             return
 
-        try:
-            self.capture(force=True)
-        finally:
-            self._writer.close()
-            self._writer = None
-            if self._active_path is not None:
-                print_green(f"Saved eval video: {self._active_path}")
-            self._active_path = None
+        self.capture(force=True)
 
     def close(self) -> None:
         self.finish_episode()
+        if self._writer is not None:
+            try:
+                self._writer.close()
+            finally:
+                self._writer = None
+                if self._active_path is not None:
+                    print_green(f"Saved eval video: {self._active_path}")
+                self._active_path = None
         if self._renderer is not None:
             self._renderer.close()
             self._renderer = None
 
-    def _episode_path(self, episode_idx: int) -> Path:
+    def _output_path(self) -> Path:
         if self.base_path.exists() and self.base_path.is_dir():
-            return self.base_path / f"episode_{episode_idx + 1:03d}.mp4"
+            return self.base_path / "eval.mp4"
         if not self.base_path.suffix:
-            return self.base_path / f"episode_{episode_idx + 1:03d}.mp4"
-        if self.num_episodes == 1:
-            return self.base_path
-        return self.base_path.with_name(
-            f"{self.base_path.stem}_ep{episode_idx + 1:03d}{self.base_path.suffix}"
-        )
+            return self.base_path / "eval.mp4"
+        return self.base_path
 
 
 ##############################################################################
@@ -683,11 +687,16 @@ def actor(agent, data_store, intvn_data_store, env, sampling_rng):
             )
         if FLAGS.eval_n_trajs <= 0:
             raise ValueError("--eval_n_trajs must be positive when running eval.")
+        if FLAGS.eval_realtime_factor < 0.0:
+            raise ValueError("--eval_realtime_factor must be non-negative.")
         if FLAGS.checkpoint_path is None:
             raise ValueError("--checkpoint_path is required when running eval.")
 
+        raw_env = get_raw_env(env)
         success_counter = 0
-        time_list = []
+        success_step_list = []
+        success_sim_time_list = []
+        success_wall_time_list = []
         checkpoint_dir = os.path.abspath(FLAGS.checkpoint_path)
         checkpoint_step = (
             None if FLAGS.eval_checkpoint_step == -1 else FLAGS.eval_checkpoint_step
@@ -727,7 +736,9 @@ def actor(agent, data_store, intvn_data_store, env, sampling_rng):
                 video_recorder.start_episode(episode)
                 renderer.maybe_render(force=True)
                 done = False
-                start_time = time.time()
+                episode_steps = 0
+                episode_start_wall_time = time.perf_counter()
+                episode_start_sim_time = float(raw_env.data.time)
                 while not done:
                     sampling_rng, key = jax.random.split(sampling_rng)
                     actions = agent.sample_actions(
@@ -737,24 +748,54 @@ def actor(agent, data_store, intvn_data_store, env, sampling_rng):
                     )
                     actions = np.asarray(jax.device_get(actions))
                     next_obs, reward, done, truncated, info = env.step(actions)
+                    episode_steps += 1
+                    if FLAGS.eval_realtime_factor > 0.0:
+                        sim_elapsed = float(raw_env.data.time) - episode_start_sim_time
+                        wall_elapsed = time.perf_counter() - episode_start_wall_time
+                        target_wall_elapsed = (
+                            sim_elapsed * FLAGS.eval_realtime_factor
+                        )
+                        sleep_s = target_wall_elapsed - wall_elapsed
+                        if sleep_s > 0.0:
+                            time.sleep(sleep_s)
                     renderer.maybe_render()
                     video_recorder.maybe_capture()
                     obs = next_obs
                     done = done or truncated
-                    if done and info.get("success", False):
-                        dt = time.time() - start_time
-                        time_list.append(dt)
-                        success_counter += 1
+                episode_wall_time = time.perf_counter() - episode_start_wall_time
+                episode_sim_time = float(raw_env.data.time) - episode_start_sim_time
+                if info.get("success", False):
+                    success_counter += 1
+                    success_step_list.append(episode_steps)
+                    success_sim_time_list.append(episode_sim_time)
+                    success_wall_time_list.append(episode_wall_time)
 
                 video_recorder.finish_episode()
-                print(f"Episode {episode + 1}: success={info.get('success', False)}")
+                print(
+                    "Episode "
+                    f"{episode + 1}: success={info.get('success', False)}, "
+                    f"steps={episode_steps}, "
+                    f"success_sim_time={episode_sim_time:.2f}s, "
+                    f"success_wall_time={episode_wall_time:.2f}s"
+                )
                 print(f"  running success rate: {success_counter}/{episode + 1}")
         finally:
             video_recorder.close()
 
         print(f"Final success rate: {success_counter / FLAGS.eval_n_trajs}")
-        if time_list:
-            print(f"Average success time: {np.mean(time_list):.2f}s")
+        if success_sim_time_list:
+            print(
+                "Average success steps: "
+                f"{np.mean(success_step_list):.1f}"
+            )
+            print(
+                "Average simulated success time: "
+                f"{np.mean(success_sim_time_list):.2f}s"
+            )
+            print(
+                "Average wall-clock rollout time: "
+                f"{np.mean(success_wall_time_list):.2f}s"
+            )
         return
 
     start_step = 0
