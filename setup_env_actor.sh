@@ -16,7 +16,7 @@ warn()  { echo -e "\033[93m[WARN]\033[0m $*"; }
 error() { echo -e "\033[91m[ERROR]\033[0m $*"; exit 1; }
 
 if [[ "$(uname)" != "Linux" ]]; then
-    error "setup_env_actor_ubuntu.sh 仅适用于 Ubuntu/Linux。"
+    error "setup_env_actor.sh 仅适用于 Ubuntu/Linux。"
 fi
 
 if ! command -v apt-get &>/dev/null; then
@@ -54,7 +54,7 @@ if [[ "$SKIP_APT" == "1" ]]; then
 else
     info "安装 Ubuntu 系统依赖"
     if ! sudo apt-get -o DPkg::Lock::Timeout="$APT_LOCK_TIMEOUT" update; then
-        error "apt-get update 失败。请先修复系统里的失效源；如果这些系统依赖已经装好，也可以使用 SKIP_APT=1 ./setup_env_actor_ubuntu.sh 跳过此步骤。"
+        error "apt-get update 失败。请先修复系统里的失效源；如果这些系统依赖已经装好，也可以使用 SKIP_APT=1 ./setup_env_actor.sh 跳过此步骤。"
     fi
 
     sudo apt-get -o DPkg::Lock::Timeout="$APT_LOCK_TIMEOUT" install -y \
