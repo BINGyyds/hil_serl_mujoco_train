@@ -32,7 +32,7 @@
 训练配置来自：
 
 - [`train/scripts/experiments/mujoco_insertion/config.py`](/home/lrb/Workspace/hil_serl_mujoco/train/scripts/experiments/mujoco_insertion/config.py)
-- [`sim/robot_controllers_mujoco/configs/insertion_config.py`](/home/lrb/Workspace/hil_serl_mujoco/sim/robot_controllers_mujoco/configs/insertion_config.py)
+- [`sim/serl_robot_infra/configs/insertion_config.py`](/home/lrb/Workspace/hil_serl_mujoco/sim/serl_robot_infra/configs/insertion_config.py)
 
 ### RL 主配置
 

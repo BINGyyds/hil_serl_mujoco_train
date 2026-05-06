@@ -4,7 +4,7 @@ set -euo pipefail
 ENV_NAME="${ENV_NAME:-hil_serl_train}"
 PYTHON_VERSION="${PYTHON_VERSION:-3.11}"
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SIM_REPO_PATH="${ROBOT_CONTROLLERS_MUJOCO_PATH:-}"
+SIM_REPO_PATH="${SERL_ROBOT_INFRA_SIM_PATH:-}"
 CONDA_CHANNEL_ARGS=(--override-channels -c conda-forge)
 CONSTRAINTS_FILE="${PROJECT_DIR}/constraints/learner_cuda_py311.txt"
 
@@ -29,8 +29,6 @@ info "Conda 安装将忽略本机 .condarc，只使用 conda-forge，避免 defa
 if [ -z "$SIM_REPO_PATH" ]; then
     if [ -d "$PROJECT_DIR/../sim" ]; then
         SIM_REPO_PATH="$PROJECT_DIR/../sim"
-    elif [ -d "$PROJECT_DIR/../robot_controllers_mujoco" ]; then
-        SIM_REPO_PATH="$PROJECT_DIR/../robot_controllers_mujoco"
     else
         SIM_REPO_PATH="$PROJECT_DIR/../sim"
     fi
@@ -52,7 +50,7 @@ if [ -d "$SIM_REPO_PATH" ]; then
     info "安装 sibling sim 仓: $SIM_REPO_PATH"
     pip install -e "$SIM_REPO_PATH"
 else
-    warn "未找到 sibling sim 仓，请确保 robot_controllers_mujoco 已提前安装。"
+    warn "未找到 sibling sim 仓，请确保 serl_robot_infra sim 包已提前安装。"
 fi
 
 info "安装 hil_serl_train"
@@ -156,14 +154,14 @@ source "$ACTIVATE_DIR/hil_serl_train_cuda_paths.sh"
 if ! python -c "
 import jax
 from serl_launcher.agents.continuous.sac import SACAgent
-from robot_controllers_mujoco.configs.insertion_config import make_insertion_config
-from robot_controllers_mujoco.envs.franka_insertion_env import FrankaInsertionEnv
+from serl_robot_infra.configs.insertion_config import make_insertion_config
+from serl_robot_infra.envs.franka_insertion_env import FrankaInsertionEnv
 print('jax devices:', jax.devices())
 env = FrankaInsertionEnv(config=make_insertion_config())
 env.reset()
 env.close()
 print('serl_launcher ok')
-print('robot_controllers_mujoco ok')
+print('serl_robot_infra ok')
 "
 then
     error "初始自检失败。请优先检查当前 shell 是否通过 .zshrc / ROS / 其他 SDK 全局注入了 /usr/local/cuda* 到 LD_LIBRARY_PATH。"

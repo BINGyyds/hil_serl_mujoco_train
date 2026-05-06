@@ -2,9 +2,9 @@
 Training configuration for the MuJoCo Franka insertion task with SpaceMouse HIL.
 """
 
-from robot_controllers_mujoco.configs.insertion_config import make_insertion_config
-from robot_controllers_mujoco.envs.franka_insertion_env import FrankaInsertionEnv
-from robot_controllers_mujoco.envs.wrappers import (
+from serl_robot_infra.configs.insertion_config import make_insertion_config
+from serl_robot_infra.envs.franka_insertion_env import FrankaInsertionEnv
+from serl_robot_infra.envs.wrappers import (
     MujocoSERLObsWrapper,
     MujocoSpacemouseIntervention,
 )

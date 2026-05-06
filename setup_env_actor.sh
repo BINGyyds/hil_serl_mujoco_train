@@ -4,7 +4,7 @@ set -euo pipefail
 ENV_NAME="${ENV_NAME:-hil_serl_actor}"
 PYTHON_VERSION="${PYTHON_VERSION:-3.11}"
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SIM_REPO_PATH="${ROBOT_CONTROLLERS_MUJOCO_PATH:-}"
+SIM_REPO_PATH="${SERL_ROBOT_INFRA_SIM_PATH:-}"
 SKIP_APT="${SKIP_APT:-0}"
 SKIP_UDEV="${SKIP_UDEV:-0}"
 APT_LOCK_TIMEOUT="${APT_LOCK_TIMEOUT:-300}"
@@ -42,8 +42,6 @@ info "Conda 安装将忽略本机 .condarc，只使用 conda-forge，避免 defa
 if [[ -z "$SIM_REPO_PATH" ]]; then
     if [[ -d "$PROJECT_DIR/../sim" ]]; then
         SIM_REPO_PATH="$PROJECT_DIR/../sim"
-    elif [[ -d "$PROJECT_DIR/../robot_controllers_mujoco" ]]; then
-        SIM_REPO_PATH="$PROJECT_DIR/../robot_controllers_mujoco"
     else
         SIM_REPO_PATH="$PROJECT_DIR/../sim"
     fi
@@ -96,7 +94,7 @@ if [[ -d "$SIM_REPO_PATH" ]]; then
     info "安装 sibling sim 仓: $SIM_REPO_PATH"
     python -m pip install -e "$SIM_REPO_PATH"
 else
-    warn "未找到 sibling sim 仓，请确保 robot_controllers_mujoco 已提前安装。"
+    warn "未找到 sibling sim 仓，请确保 serl_robot_infra sim 包已提前安装。"
 fi
 
 info "安装 hil_serl_train"
@@ -139,8 +137,8 @@ python -m pip uninstall -y typing \
 
 python -c "
 import jax
-from robot_controllers_mujoco.configs.insertion_config import make_insertion_config
-from robot_controllers_mujoco.envs.franka_insertion_env import FrankaInsertionEnv
+from serl_robot_infra.configs.insertion_config import make_insertion_config
+from serl_robot_infra.envs.franka_insertion_env import FrankaInsertionEnv
 from serl_launcher.agents.continuous.sac import SACAgent
 print('jax devices:', jax.devices())
 env = FrankaInsertionEnv(config=make_insertion_config())
@@ -148,7 +146,7 @@ env.reset()
 env.close()
 print('actor env ok')
 print('serl_launcher ok')
-print('robot_controllers_mujoco ok')
+print('serl_robot_infra ok')
 "
 
 echo

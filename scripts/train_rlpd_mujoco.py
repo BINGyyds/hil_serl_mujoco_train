@@ -36,13 +36,12 @@ if __package__ in (None, ""):
         sys.path.remove(repo_root_str)
     sys.path.insert(0, repo_root_str)
 
-    for sibling_name in ("sim", "robot_controllers_mujoco"):
-        sibling_sim = parent_root / sibling_name
-        if sibling_sim.exists():
-            sibling_sim_str = str(sibling_sim)
-            if sibling_sim_str in sys.path:
-                sys.path.remove(sibling_sim_str)
-            sys.path.insert(1, sibling_sim_str)
+    sibling_sim = parent_root / "sim"
+    if sibling_sim.exists():
+        sibling_sim_str = str(sibling_sim)
+        if sibling_sim_str in sys.path:
+            sys.path.remove(sibling_sim_str)
+        sys.path.insert(1, sibling_sim_str)
 
 import jax
 import jax.numpy as jnp
