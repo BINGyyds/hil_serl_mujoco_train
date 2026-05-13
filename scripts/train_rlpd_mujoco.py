@@ -189,6 +189,78 @@ def resolve_metrics_dir() -> Optional[Path]:
     return None
 
 
+def build_learner_ip_candidates(ip: str) -> list[str]:
+    """Return a small ordered list of learner endpoints for actor retries.
+
+    Local runs are common in this repo. When the user passes a machine IP
+    (for example a VPN / tailscale address) from the same host, that route may
+    not loop back reliably. Including localhost as a fallback keeps same-host
+    actor/learner runs robust without affecting true remote runs.
+    """
+    candidates: list[str] = []
+    normalized = ip.strip()
+    if normalized:
+        candidates.append(normalized)
+
+    localhost_aliases = ("localhost", "127.0.0.1", "::1")
+    if normalized not in localhost_aliases:
+        candidates.extend(localhost_aliases[:2])
+
+    deduped: list[str] = []
+    seen = set()
+    for candidate in candidates:
+        if candidate not in seen:
+            deduped.append(candidate)
+            seen.add(candidate)
+    return deduped
+
+
+def create_actor_trainer_client(*, data_stores: dict[str, Any]) -> TrainerClient:
+    """Connect an actor to the learner with localhost fallback retries."""
+    target_ips = build_learner_ip_candidates(FLAGS.ip)
+    retry_sleep_s = 2.0
+    last_warning_time = 0.0
+
+    while True:
+        last_errors: list[str] = []
+        for target_ip in target_ips:
+            try:
+                client = TrainerClient(
+                    "actor_env",
+                    target_ip,
+                    make_trainer_config(),
+                    data_stores=data_stores,
+                    wait_for_server=False,
+                    timeout_ms=FLAGS.actor_stats_timeout_ms,
+                )
+                if target_ip != FLAGS.ip:
+                    print_green(
+                        "Actor connected to learner via "
+                        f"{target_ip} (requested --ip {FLAGS.ip})."
+                    )
+                return client
+            except Exception as exc:
+                last_errors.append(f"{target_ip}: {exc}")
+
+        now = time.monotonic()
+        if now - last_warning_time >= retry_sleep_s:
+            print(
+                "[WARN] actor could not reach learner yet. "
+                f"Tried {', '.join(target_ips)}. "
+                f"Retrying in {retry_sleep_s:.1f}s. "
+                f"Last errors: {' | '.join(last_errors)}",
+                flush=True,
+            )
+            if FLAGS.ip not in ("localhost", "127.0.0.1"):
+                print(
+                    "[INFO] If actor and learner are on the same machine, "
+                    "using --ip localhost is recommended.",
+                    flush=True,
+                )
+            last_warning_time = now
+        time.sleep(retry_sleep_s)
+
+
 class EpisodeMetricsWriter:
     """Append actor episode metrics to a local CSV file."""
 
@@ -810,14 +882,7 @@ def actor(agent, data_store, intvn_data_store, env, sampling_rng):
         "actor_env_intvn": intvn_data_store,
     }
 
-    client = TrainerClient(
-        "actor_env",
-        FLAGS.ip,
-        make_trainer_config(),
-        data_stores=datastore_dict,
-        wait_for_server=True,
-        timeout_ms=FLAGS.actor_stats_timeout_ms,
-    )
+    client = create_actor_trainer_client(data_stores=datastore_dict)
 
     def update_params(params):
         nonlocal agent

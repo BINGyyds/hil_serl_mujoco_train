@@ -34,8 +34,8 @@ class TrainConfig(DefaultTrainingConfig):
     discount = 0.99
     cta_ratio = 2
 
-    max_steps = 5_000_000
-    replay_buffer_capacity = 5_000_000
+    max_steps = 1_000_000
+    replay_buffer_capacity = 1_000_000
     training_starts = 1000
     random_steps = 1000
     steps_per_update = 10
