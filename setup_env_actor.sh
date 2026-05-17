@@ -15,6 +15,31 @@ info()  { echo -e "\033[92m[INFO]\033[0m $*"; }
 warn()  { echo -e "\033[93m[WARN]\033[0m $*"; }
 error() { echo -e "\033[91m[ERROR]\033[0m $*"; exit 1; }
 
+clean_python_numeric_stack() {
+    python - <<'PY'
+import shutil
+import site
+from pathlib import Path
+
+targets = ("numpy", "scipy")
+for site_dir in map(Path, site.getsitepackages()):
+    if not site_dir.exists():
+        continue
+    for name in targets:
+        for path in (
+            site_dir / name,
+            site_dir / f"{name}.libs",
+        ):
+            if path.exists():
+                print(f"[cleanup] removing {path}")
+                shutil.rmtree(path, ignore_errors=True)
+        for pattern in (f"{name}-*.dist-info", f"{name}-*.egg-info"):
+            for path in site_dir.glob(pattern):
+                print(f"[cleanup] removing {path}")
+                shutil.rmtree(path, ignore_errors=True)
+PY
+}
+
 if [[ "$(uname)" != "Linux" ]]; then
     error "setup_env_actor.sh 仅适用于 Ubuntu/Linux。"
 fi
@@ -92,6 +117,7 @@ python -m pip install --upgrade pip setuptools wheel
 
 if [[ -d "$SIM_REPO_PATH" ]]; then
     info "安装 sibling sim 仓: $SIM_REPO_PATH"
+    conda install "${CONDA_CHANNEL_ARGS[@]}" -n "$ENV_NAME" pinocchio -y
     python -m pip install -e "$SIM_REPO_PATH"
 else
     warn "未找到 sibling sim 仓，请确保 serl_robot_infra sim 包已提前安装。"
@@ -124,12 +150,13 @@ python -m pip uninstall -y \
     nvidia-cusparse-cu13 \
     nvidia-nvjitlink-cu13 || true
 
+info "清理残留的 numpy/scipy 安装产物，避免 pip/conda 混装后导入错乱"
+clean_python_numeric_stack
+
 info "安装 actor 精确约束版本（CPU JAX 0.6.2）"
 python -m pip install --upgrade --force-reinstall -r "$CONSTRAINTS_FILE"
 
-info "安装可选轻量网页 viewer 依赖（Pinocchio + MeshCat）"
-conda install "${CONDA_CHANNEL_ARGS[@]}" -n "$ENV_NAME" pinocchio -y \
-    || warn "Pinocchio 安装失败；--actor_viewer meshcat 将不可用。"
+info "安装可选轻量网页 viewer 依赖（MeshCat）"
 python -m pip install meshcat==0.3.2 \
     || warn "MeshCat 安装失败；--actor_viewer meshcat 将不可用。"
 python -m pip uninstall -y typing \
@@ -137,10 +164,12 @@ python -m pip uninstall -y typing \
 
 python -c "
 import jax
+import pinocchio as pin
 from serl_robot_infra.configs.insertion_config import make_insertion_config
 from serl_robot_infra.envs.franka_insertion_env import FrankaInsertionEnv
 from serl_launcher.agents.continuous.sac import SACAgent
 print('jax devices:', jax.devices())
+print('pinocchio:', pin.__version__)
 env = FrankaInsertionEnv(config=make_insertion_config())
 env.reset()
 env.close()

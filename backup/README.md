@@ -7,59 +7,86 @@
 - 训练配置记录
 - 后续用于汇报或展示的评估视频
 
-## 当前建议结构
 
-```text
-train/backup/
-└── YYYYMMDD[_tag]/
-    ├── README.md
-    ├── checkpoint_xxxxxxx/
-    ├── metrics/
-    └── eval_videos/        # 可选
-```
+## 20260430 训练备份
 
-## 说明
+优化任务完成奖励，强化学习训练第一次成功
 
-- `README.md`
-  - 记录这次备份的训练配置、环境参数、关键结果和评估方式
-- `checkpoint_xxxxxxx/`
-  - 保存一个明确要保留的 checkpoint
-- `metrics/`
-  - 保存 `episode_metrics.csv` 与导出的 reward / success / error 曲线
-- `eval_videos/`
-  - 可选，保存用于展示的 MP4
+### 基本配置
 
-## 对当前结构的建议
+- `max_steps = 5_000_000`
+- `replay_buffer_capacity = 5_000_000`
 
-你现在的结构整体是合理的，已经具备：
+### Reward 配置
 
-- 训练结果
-- 曲线
-- checkpoint
+- `reward_xy_weight = 8.0`
+- `reward_z_weight = 1.5`
+- `reward_rot_weight = 0.3`
+- `reward_depth_weight = 2.0`
+- `reward_success_bonus = 2000.0`
+- `reward_failure_penalty = 25.0`
+- `reward_step_penalty = 0.01`
+- `reward_depth_xy_threshold = 0.004`
+- `reward_depth_rot_threshold = 0.12`
 
-这三类最重要的内容。
+当前 reward 设计为：
 
-为了后续推到 GitHub 更清晰，建议再保持两个习惯：
+- 位置误差惩罚
+- 姿态误差惩罚
+- 弱绝对深度奖励
+- 较大的成功奖励
 
-1. 每个备份目录都放一份 `README.md`
-   - 说明这次训练到底用了什么配置
-   - 否则时间一长，很容易忘记这份 checkpoint 是怎么来的
+### Success 判据
 
-2. 如果同一天会备份多次，目录名建议加短标签
-   - 例如：`20260430_absdepth_success2000`
-   - 比只用日期更容易区分
+- `success_xy_threshold = 0.002`
+- `success_rot_threshold = 0.1`
+- `success_z_gap_threshold = 0.002`
+- `success_linear_velocity_threshold = 0.01`
+- `success_angular_velocity_threshold = 0.05`
 
-## GitHub 说明
+也就是说，任务成功要求：
 
-当前 `train/backup/20260430` 大约是：
+- XY 对齐误差足够小
+- 姿态误差足够小
+- Z gap 足够小
+- 末端线速度足够小
+- 末端角速度足够小
 
-- checkpoint：约 `3.7M`
-- metrics：约 `15M`
-- 总计：约 `18M`
 
-这个体量推到 GitHub **没有问题**。  
-如果后面开始备份更多 checkpoint、视频或更大的 CSV，建议：
+## 20260513 训练备份
 
-- 只保留代表性 checkpoint
-- 或把大视频放到 release / 外部存储
-- 或使用 Git LFS
+仓库结构优化后强化学习训练验证
+
+### 基本配置
+
+- `max_steps = 1_000_000`
+- `replay_buffer_capacity = 1_000_000`
+
+其他配置同0430训练
+
+## 20260514 训练备份
+
+Obsservation Action Controller全都放到body-frame下的SE(3)量进行训练，但是控制器依然是速度控制，训练依然是固定pitch和hole的位置，训练结果表明，在hole的xy坐标变化的额情况下效果还行，但是一旦hole的角度变化效果就很差，基本无法成功。
+
+### 基本配置
+
+- `max_steps = 500_000`
+- `replay_buffer_capacity = 500_000`
+
+## 20260515 训练备份
+
+在0514训练基础上将控制链路都替换为SE(3)阻抗控制，控制器采用力矩控制
+训练得到的结果图成功率等指标收敛的很好，但是评估模型性能的时候表现很差，很奇怪
+验证结论是：当前 policy 确实学会了“把 peg 拉回默认 hole”，但没有学会“当任务 frame 自己变了时，也做等价行为”
+
+### 基本配置
+
+- `max_steps = 5_000_000`
+- `replay_buffer_capacity = 5_000_000`
+
+### Reward 配置
+
+提高了reward_rot_weight，希望agent能学到对齐姿态的policy，这点在完成任务方面很关键
+
+- `reward_rot_weight = 1.2`
+

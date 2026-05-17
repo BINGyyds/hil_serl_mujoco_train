@@ -12,6 +12,31 @@ info()  { echo -e "\033[92m[INFO]\033[0m $*"; }
 warn()  { echo -e "\033[93m[WARN]\033[0m $*"; }
 error() { echo -e "\033[91m[ERROR]\033[0m $*"; exit 1; }
 
+clean_python_numeric_stack() {
+    python - <<'PY'
+import shutil
+import site
+from pathlib import Path
+
+targets = ("numpy", "scipy")
+for site_dir in map(Path, site.getsitepackages()):
+    if not site_dir.exists():
+        continue
+    for name in targets:
+        for path in (
+            site_dir / name,
+            site_dir / f"{name}.libs",
+        ):
+            if path.exists():
+                print(f"[cleanup] removing {path}")
+                shutil.rmtree(path, ignore_errors=True)
+        for pattern in (f"{name}-*.dist-info", f"{name}-*.egg-info"):
+            for path in site_dir.glob(pattern):
+                print(f"[cleanup] removing {path}")
+                shutil.rmtree(path, ignore_errors=True)
+PY
+}
+
 if command -v conda &>/dev/null; then
     CONDA_BIN="$(command -v conda)"
 elif [ -f "$HOME/miniconda3/bin/conda" ]; then
@@ -48,6 +73,7 @@ pip install --upgrade pip setuptools wheel
 
 if [ -d "$SIM_REPO_PATH" ]; then
     info "安装 sibling sim 仓: $SIM_REPO_PATH"
+    conda install "${CONDA_CHANNEL_ARGS[@]}" -n "$ENV_NAME" pinocchio -y
     pip install -e "$SIM_REPO_PATH"
 else
     warn "未找到 sibling sim 仓，请确保 serl_robot_infra sim 包已提前安装。"
@@ -80,6 +106,9 @@ pip uninstall -y \
     nvidia-cusparse-cu13 \
     nvidia-nvjitlink-cu13 || true
 
+info "清理残留的 numpy/scipy 安装产物，避免 pip/conda 混装后导入错乱"
+clean_python_numeric_stack
+
 info "安装 learner 精确约束版本（JAX 0.6.2 + bundled CUDA/cuDNN）"
 pip install --upgrade --force-reinstall -r "$CONSTRAINTS_FILE"
 
@@ -90,6 +119,7 @@ mkdir -p "$ACTIVATE_DIR" "$DEACTIVATE_DIR"
 cat > "$ACTIVATE_DIR/hil_serl_train_cuda_paths.sh" <<'EOF'
 #!/usr/bin/env bash
 export _HIL_SERL_TRAIN_OLD_LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}"
+export _HIL_SERL_TRAIN_OLD_XLA_PYTHON_CLIENT_PREALLOCATE="${XLA_PYTHON_CLIENT_PREALLOCATE-__UNSET__}"
 
 _hil_serl_train_filtered_ld="$(
 python - <<'PY'
@@ -137,6 +167,10 @@ else
     export LD_LIBRARY_PATH="${_hil_serl_train_filtered_ld}"
 fi
 
+if [[ -z "${XLA_PYTHON_CLIENT_PREALLOCATE:-}" ]]; then
+    export XLA_PYTHON_CLIENT_PREALLOCATE="false"
+fi
+
 unset _hil_serl_train_filtered_ld
 unset _hil_serl_train_bundled_cuda
 EOF
@@ -147,16 +181,24 @@ if [[ -n "${_HIL_SERL_TRAIN_OLD_LD_LIBRARY_PATH+x}" ]]; then
     export LD_LIBRARY_PATH="${_HIL_SERL_TRAIN_OLD_LD_LIBRARY_PATH}"
     unset _HIL_SERL_TRAIN_OLD_LD_LIBRARY_PATH
 fi
+if [[ "${_HIL_SERL_TRAIN_OLD_XLA_PYTHON_CLIENT_PREALLOCATE-__UNSET__}" == "__UNSET__" ]]; then
+    unset XLA_PYTHON_CLIENT_PREALLOCATE
+else
+    export XLA_PYTHON_CLIENT_PREALLOCATE="${_HIL_SERL_TRAIN_OLD_XLA_PYTHON_CLIENT_PREALLOCATE}"
+fi
+unset _HIL_SERL_TRAIN_OLD_XLA_PYTHON_CLIENT_PREALLOCATE
 EOF
 
 source "$ACTIVATE_DIR/hil_serl_train_cuda_paths.sh"
 
 if ! python -c "
 import jax
+import pinocchio as pin
 from serl_launcher.agents.continuous.sac import SACAgent
 from serl_robot_infra.configs.insertion_config import make_insertion_config
 from serl_robot_infra.envs.franka_insertion_env import FrankaInsertionEnv
 print('jax devices:', jax.devices())
+print('pinocchio:', pin.__version__)
 env = FrankaInsertionEnv(config=make_insertion_config())
 env.reset()
 env.close()

@@ -7,6 +7,7 @@
 - 算法：state-based SAC / RLPD
 - 数据：demo buffer + replay buffer
 - 评估：success stats + MP4 + metrics
+- 仿真控制：effort scene + `SE(3)` torque control + NRIC
 
 ## 安装
 
@@ -32,7 +33,7 @@ conda activate hil_serl_train
 python scripts/train_rlpd_mujoco.py \
   --exp_name mujoco_insertion \
   --learner \
-  --demo_path demo_data/insertion_demos.pkl \
+  --demo_path ../sim/demo_data/insertion_demos.pkl \
   --checkpoint_path output/mujoco_insertion
 ```
 

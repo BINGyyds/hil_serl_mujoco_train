@@ -25,6 +25,7 @@ import os
 import pickle as pkl
 import sys
 import time
+from collections import defaultdict
 from pathlib import Path
 from typing import Any, Optional, Tuple
 
@@ -42,6 +43,12 @@ if __package__ in (None, ""):
         if sibling_sim_str in sys.path:
             sys.path.remove(sibling_sim_str)
         sys.path.insert(1, sibling_sim_str)
+
+# On desktop Ubuntu setups, JAX's default GPU memory preallocation can starve
+# GNOME / Xorg / Chrome of VRAM and trigger a black screen when the display
+# reconfigures or wakes up. Keep the default conservative unless the user has
+# explicitly chosen otherwise in their shell environment.
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
 import jax
 import jax.numpy as jnp
@@ -78,6 +85,45 @@ flags.DEFINE_multi_string("demo_path", None, "Path(s) to the demo data.")
 flags.DEFINE_string("checkpoint_path", None, "Path to save checkpoints.")
 flags.DEFINE_integer("eval_checkpoint_step", 0, "Step to evaluate the checkpoint.")
 flags.DEFINE_integer("eval_n_trajs", 0, "Number of trajectories to evaluate.")
+flags.DEFINE_boolean(
+    "eval_sample_task_case",
+    False,
+    "Sample XY+yaw task cases on each eval reset for transfer testing.",
+)
+flags.DEFINE_enum(
+    "eval_task_case_range_preset",
+    "aligned",
+    ["aligned", "wide"],
+    "Task-case sampling range preset for eval. "
+    "'aligned' matches the training reset distribution; "
+    "'wide' restores the broader XY+yaw transfer range.",
+)
+flags.DEFINE_boolean(
+    "eval_disable_nric",
+    False,
+    "Disable NRIC only for eval environments to isolate control-layer effects.",
+)
+flags.DEFINE_boolean(
+    "eval_zero_nullspace",
+    False,
+    "Set nullspace stiffness/damping to zero only for eval environments.",
+)
+flags.DEFINE_boolean(
+    "eval_transfer_diagnostics",
+    False,
+    "Run strict default-only transfer diagnostics: bucketed eval, policy "
+    "action consistency probe, and closed-loop invariance probe.",
+)
+flags.DEFINE_integer(
+    "eval_transfer_probe_num_states",
+    12,
+    "Number of successful default states to probe for transfer diagnostics.",
+)
+flags.DEFINE_integer(
+    "eval_transfer_probe_horizon",
+    40,
+    "Fixed-action closed-loop probe horizon for transfer diagnostics.",
+)
 flags.DEFINE_float(
     "eval_realtime_factor",
     0.0,
@@ -331,6 +377,456 @@ def iter_env_chain(env):
 def get_raw_env(env):
     """Return the innermost unwrapped Gymnasium env when available."""
     return getattr(env, "unwrapped", env)
+
+
+def find_wrapper_by_name(env, class_name: str):
+    """Return the first wrapper whose class name matches ``class_name``."""
+    for wrapped_env in iter_env_chain(env):
+        if wrapped_env.__class__.__name__ == class_name:
+            return wrapped_env
+    return None
+
+
+def build_policy_observation_from_raw_env(env, raw_env, raw_obs: Optional[dict] = None):
+    """Build the policy-facing observation from a raw env observation."""
+    raw_obs = raw_env._get_obs() if raw_obs is None else raw_obs
+    obs_wrapper = find_wrapper_by_name(env, "MujocoSERLObsWrapper")
+    policy_obs = raw_obs if obs_wrapper is None else obs_wrapper.observation(raw_obs)
+    return {key: np.asarray(value)[None] for key, value in policy_obs.items()}
+
+
+TRANSFER_BUCKET_ORDER = (
+    "default",
+    "small_xy",
+    "medium_xy",
+    "large_xy",
+    "small_yaw",
+    "medium_yaw",
+    "large_yaw",
+    "combined_xy_yaw",
+)
+
+TRANSFER_BUCKET_LABELS = {
+    "default": "default",
+    "small_xy": "small XY [0, 2mm]",
+    "medium_xy": "medium XY (2, 5]mm",
+    "large_xy": "large XY (5, 10]mm",
+    "small_yaw": "small yaw [0, 5deg]",
+    "medium_yaw": "medium yaw (5, 10]deg",
+    "large_yaw": "large yaw (10, 15]deg",
+    "combined_xy_yaw": "combined XY+yaw",
+}
+
+
+def sample_task_case_for_bucket(raw_env, bucket: str, rng: np.random.Generator):
+    """Sample a deterministic-style eval case from one transfer bucket."""
+    if bucket == "default":
+        return None
+
+    xy_bucket_limits = {
+        "small_xy": (0.0, 0.002),
+        "medium_xy": (0.002, 0.005),
+        "large_xy": (0.005, 0.010),
+    }
+    yaw_bucket_limits = {
+        "small_yaw": (0.0, np.deg2rad(5.0)),
+        "medium_yaw": (np.deg2rad(5.0), np.deg2rad(10.0)),
+        "large_yaw": (np.deg2rad(10.0), np.deg2rad(15.0)),
+    }
+
+    xy = np.zeros(2, dtype=np.float64)
+    yaw = 0.0
+
+    if bucket in xy_bucket_limits:
+        radius_low, radius_high = xy_bucket_limits[bucket]
+        radius = rng.uniform(radius_low, radius_high)
+        angle = rng.uniform(0.0, 2.0 * np.pi)
+        xy = radius * np.array([np.cos(angle), np.sin(angle)], dtype=np.float64)
+    elif bucket in yaw_bucket_limits:
+        yaw_low, yaw_high = yaw_bucket_limits[bucket]
+        yaw_mag = rng.uniform(yaw_low, yaw_high)
+        yaw = float(yaw_mag * rng.choice([-1.0, 1.0]))
+    elif bucket == "combined_xy_yaw":
+        radius = rng.uniform(0.002, 0.010)
+        angle = rng.uniform(0.0, 2.0 * np.pi)
+        xy = radius * np.array([np.cos(angle), np.sin(angle)], dtype=np.float64)
+        yaw_mag = rng.uniform(np.deg2rad(5.0), np.deg2rad(15.0))
+        yaw = float(yaw_mag * rng.choice([-1.0, 1.0]))
+    else:
+        raise ValueError(f"Unknown transfer bucket: {bucket}")
+
+    return {"task_case": {"xy": xy, "yaw": yaw}}
+
+
+def capture_transfer_metrics(raw_env) -> dict[str, Any]:
+    """Collect the task-relative metrics we care about for diagnostics."""
+    raw_obs = raw_env._get_obs()
+    info = raw_env._get_info(raw_obs)
+    return {
+        "pose_error_body": np.asarray(raw_obs["state"]["pose_error_body"], dtype=np.float64),
+        "twist_body": np.asarray(raw_obs["state"]["twist_body"], dtype=np.float64),
+        "xy_error": float(info["xy_error"]),
+        "z_gap": float(info["z_gap"]),
+        "rot_error": float(info["rot_error"]),
+        "success": bool(info["success"]),
+        "task_case_x": float(info.get("task_case_x", 0.0)),
+        "task_case_y": float(info.get("task_case_y", 0.0)),
+        "task_case_yaw": float(info.get("task_case_yaw", 0.0)),
+        "reset_case_x": float(info.get("reset_case_x", 0.0)),
+        "reset_case_y": float(info.get("reset_case_y", 0.0)),
+        "reset_case_z": float(info.get("reset_case_z", 0.0)),
+        "reset_case_yaw": float(info.get("reset_case_yaw", 0.0)),
+    }
+
+
+def sample_policy_action(agent, obs, sampling_rng):
+    """Sample one deterministic policy action and return the advanced RNG."""
+    sampling_rng, key = jax.random.split(sampling_rng)
+    action = agent.sample_actions(
+        observations=jax.device_put(obs),
+        argmax=True,
+        seed=key,
+    )
+    return np.asarray(jax.device_get(action)), sampling_rng
+
+
+def run_eval_episode(
+    *,
+    agent,
+    env,
+    raw_env,
+    sampling_rng,
+    renderer,
+    video_recorder,
+    reset_options=None,
+    realtime_factor: float = 0.0,
+    collect_trace: bool = False,
+):
+    """Run one eval episode and optionally collect per-step default-case states."""
+    obs, _ = env.reset(options=reset_options)
+    if video_recorder is not None:
+        video_recorder.start_episode(0)
+    if renderer is not None:
+        renderer.maybe_render(force=True)
+    done = False
+    episode_steps = 0
+    episode_trace = []
+    episode_start_wall_time = time.perf_counter()
+    episode_start_sim_time = float(raw_env.data.time)
+
+    while not done:
+        if collect_trace:
+            episode_trace.append(
+                {
+                    "snapshot": raw_env.capture_diagnostic_snapshot(),
+                    "obs": copy.deepcopy(obs),
+                }
+            )
+        actions, sampling_rng = sample_policy_action(agent, obs, sampling_rng)
+        if collect_trace:
+            episode_trace[-1]["action"] = actions.copy()
+        next_obs, reward, terminated, truncated, info = env.step(actions)
+        episode_steps += 1
+        if realtime_factor > 0.0:
+            sim_elapsed = float(raw_env.data.time) - episode_start_sim_time
+            wall_elapsed = time.perf_counter() - episode_start_wall_time
+            target_wall_elapsed = sim_elapsed * realtime_factor
+            sleep_s = target_wall_elapsed - wall_elapsed
+            if sleep_s > 0.0:
+                time.sleep(sleep_s)
+        if renderer is not None:
+            renderer.maybe_render()
+        if video_recorder is not None:
+            video_recorder.maybe_capture()
+        obs = next_obs
+        done = terminated or truncated
+
+    episode_wall_time = time.perf_counter() - episode_start_wall_time
+    episode_sim_time = float(raw_env.data.time) - episode_start_sim_time
+    if video_recorder is not None:
+        video_recorder.finish_episode()
+
+    result = {
+        "success": bool(info.get("success", False)),
+        "steps": int(episode_steps),
+        "success_sim_time": float(episode_sim_time),
+        "success_wall_time": float(episode_wall_time),
+        "xy_error": float(info.get("xy_error", np.nan)),
+        "z_gap": float(info.get("z_gap", np.nan)),
+        "rot_error": float(info.get("rot_error", np.nan)),
+        "task_case_x": float(info.get("task_case_x", 0.0)),
+        "task_case_y": float(info.get("task_case_y", 0.0)),
+        "task_case_yaw": float(info.get("task_case_yaw", 0.0)),
+        "reset_case_x": float(info.get("reset_case_x", 0.0)),
+        "reset_case_y": float(info.get("reset_case_y", 0.0)),
+        "reset_case_z": float(info.get("reset_case_z", 0.0)),
+        "reset_case_yaw": float(info.get("reset_case_yaw", 0.0)),
+        "trace": episode_trace,
+    }
+    return result, sampling_rng
+
+
+def summarize_bucket_results(bucket_results: dict[str, list[dict[str, Any]]]) -> None:
+    """Print a compact summary of strict transfer buckets."""
+    print("\nTransfer bucket summary:")
+    for bucket in TRANSFER_BUCKET_ORDER:
+        rows = bucket_results.get(bucket, [])
+        label = TRANSFER_BUCKET_LABELS[bucket]
+        if not rows:
+            print(f"  {label}: no episodes")
+            continue
+        success_rate = float(np.mean([row["success"] for row in rows]))
+        success_steps = [row["steps"] for row in rows if row["success"]]
+        mean_steps = float(np.mean(success_steps)) if success_steps else float("nan")
+        mean_xy = float(np.mean([row["xy_error"] for row in rows]))
+        mean_z = float(np.mean([row["z_gap"] for row in rows]))
+        mean_rot = float(np.mean([row["rot_error"] for row in rows]))
+        steps_str = f"{mean_steps:.1f}" if success_steps else "n/a"
+        print(
+            f"  {label}: success_rate={success_rate:.3f}, "
+            f"avg_success_steps={steps_str}, "
+            f"final_xy={mean_xy:.4f}, final_z_gap={mean_z:.4f}, "
+            f"final_rot={mean_rot:.4f}"
+        )
+
+
+def select_probe_samples(samples: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    """Evenly subsample a list of recorded default-case states."""
+    if limit <= 0 or not samples:
+        return []
+    count = min(limit, len(samples))
+    indices = np.linspace(0, len(samples) - 1, num=count, dtype=int)
+    return [samples[int(index)] for index in indices]
+
+
+def run_policy_action_consistency_probe(
+    *,
+    agent,
+    env,
+    raw_env,
+    sampling_rng,
+    default_samples: list[dict[str, Any]],
+    num_states: int,
+    rng: np.random.Generator,
+):
+    """Check whether matched task-relative states produce similar policy actions."""
+    selected_samples = select_probe_samples(default_samples, num_states)
+    results = []
+    for idx, sample in enumerate(selected_samples):
+        sampled_case = sample_task_case_for_bucket(raw_env, "combined_xy_yaw", rng)
+        if sampled_case is None:
+            continue
+
+        raw_env.restore_diagnostic_snapshot(sample["snapshot"])
+        default_raw_obs = raw_env._get_obs()
+        default_policy_obs = build_policy_observation_from_raw_env(
+            env,
+            raw_env,
+            raw_obs=default_raw_obs,
+        )
+        default_action, sampling_rng = sample_policy_action(
+            agent,
+            default_policy_obs,
+            sampling_rng,
+        )
+
+        raw_env.restore_transformed_diagnostic_snapshot(
+            sample["snapshot"],
+            xy_offset=sampled_case["task_case"]["xy"],
+            yaw_offset=sampled_case["task_case"]["yaw"],
+        )
+        case_raw_obs = raw_env._get_obs()
+        case_policy_obs = build_policy_observation_from_raw_env(
+            env,
+            raw_env,
+            raw_obs=case_raw_obs,
+        )
+        case_action, sampling_rng = sample_policy_action(
+            agent,
+            case_policy_obs,
+            sampling_rng,
+        )
+
+        action_diff = float(np.linalg.norm(default_action - case_action))
+        pose_error_diff = float(
+            np.linalg.norm(
+                np.asarray(default_raw_obs["state"]["pose_error_body"], dtype=np.float64)
+                - np.asarray(case_raw_obs["state"]["pose_error_body"], dtype=np.float64)
+            )
+        )
+        twist_diff = float(
+            np.linalg.norm(
+                np.asarray(default_raw_obs["state"]["twist_body"], dtype=np.float64)
+                - np.asarray(case_raw_obs["state"]["twist_body"], dtype=np.float64)
+            )
+        )
+        results.append(
+            {
+                "index": idx,
+                "task_case_xy": sampled_case["task_case"]["xy"].copy(),
+                "task_case_yaw": float(sampled_case["task_case"]["yaw"]),
+                "action_diff": action_diff,
+                "pose_error_diff": pose_error_diff,
+                "twist_diff": twist_diff,
+            }
+        )
+
+    if results:
+        action_diffs = np.asarray([item["action_diff"] for item in results], dtype=np.float64)
+        pose_diffs = np.asarray([item["pose_error_diff"] for item in results], dtype=np.float64)
+        twist_diffs = np.asarray([item["twist_diff"] for item in results], dtype=np.float64)
+        print("\nPolicy action consistency probe:")
+        print(
+            "  sampled states="
+            f"{len(results)}, action_diff mean={action_diffs.mean():.4f}, "
+            f"median={np.median(action_diffs):.4f}, max={action_diffs.max():.4f}"
+        )
+        print(
+            "  matched observation diffs: "
+            f"pose_error_body mean={pose_diffs.mean():.6f}, "
+            f"twist_body mean={twist_diffs.mean():.6f}"
+        )
+    else:
+        print("\nPolicy action consistency probe: no successful default states available.")
+    return results, sampling_rng
+
+
+def rollout_fixed_action_sequence(
+    *,
+    raw_env,
+    snapshot: dict[str, Any],
+    action_sequence: list[np.ndarray],
+    task_case: Optional[dict[str, Any]] = None,
+):
+    """Roll out a fixed action sequence from a default or matched transformed state."""
+    if task_case is None:
+        raw_env.restore_diagnostic_snapshot(snapshot)
+    else:
+        raw_env.restore_transformed_diagnostic_snapshot(
+            snapshot,
+            xy_offset=task_case["xy"],
+            yaw_offset=task_case["yaw"],
+        )
+
+    trajectory = [capture_transfer_metrics(raw_env)]
+    for action in action_sequence:
+        _, _, terminated, truncated, _ = raw_env.step(np.asarray(action, dtype=np.float64))
+        trajectory.append(capture_transfer_metrics(raw_env))
+        if terminated or truncated:
+            break
+    return trajectory
+
+
+def run_closed_loop_invariance_probe(
+    *,
+    agent,
+    env,
+    raw_env,
+    sampling_rng,
+    default_samples: list[dict[str, Any]],
+    num_states: int,
+    horizon: int,
+    rng: np.random.Generator,
+):
+    """Compare closed-loop evolution under the same action sequence."""
+    selected_samples = select_probe_samples(default_samples, max(1, min(num_states, 5)))
+    results = []
+    for idx, sample in enumerate(selected_samples):
+        sampled_case = sample_task_case_for_bucket(raw_env, "combined_xy_yaw", rng)
+        if sampled_case is None:
+            continue
+
+        raw_env.restore_diagnostic_snapshot(sample["snapshot"])
+        action_sequence: list[np.ndarray] = []
+        for _ in range(max(horizon, 1)):
+            policy_obs = build_policy_observation_from_raw_env(env, raw_env)
+            action, sampling_rng = sample_policy_action(agent, policy_obs, sampling_rng)
+            action_sequence.append(action.copy())
+            _, _, terminated, truncated, _ = raw_env.step(action)
+            if terminated or truncated:
+                break
+
+        default_traj = rollout_fixed_action_sequence(
+            raw_env=raw_env,
+            snapshot=sample["snapshot"],
+            action_sequence=action_sequence,
+            task_case=None,
+        )
+        case_traj = rollout_fixed_action_sequence(
+            raw_env=raw_env,
+            snapshot=sample["snapshot"],
+            action_sequence=action_sequence,
+            task_case=sampled_case["task_case"],
+        )
+
+        common_length = min(len(default_traj), len(case_traj))
+        pose_diffs = np.asarray(
+            [
+                np.linalg.norm(
+                    default_traj[t]["pose_error_body"] - case_traj[t]["pose_error_body"]
+                )
+                for t in range(common_length)
+            ],
+            dtype=np.float64,
+        )
+        twist_diffs = np.asarray(
+            [
+                np.linalg.norm(
+                    default_traj[t]["twist_body"] - case_traj[t]["twist_body"]
+                )
+                for t in range(common_length)
+            ],
+            dtype=np.float64,
+        )
+        xy_diffs = np.asarray(
+            [
+                abs(default_traj[t]["xy_error"] - case_traj[t]["xy_error"])
+                for t in range(common_length)
+            ],
+            dtype=np.float64,
+        )
+        z_gap_diffs = np.asarray(
+            [
+                abs(default_traj[t]["z_gap"] - case_traj[t]["z_gap"])
+                for t in range(common_length)
+            ],
+            dtype=np.float64,
+        )
+        rot_diffs = np.asarray(
+            [
+                abs(default_traj[t]["rot_error"] - case_traj[t]["rot_error"])
+                for t in range(common_length)
+            ],
+            dtype=np.float64,
+        )
+
+        results.append(
+            {
+                "index": idx,
+                "task_case_xy": sampled_case["task_case"]["xy"].copy(),
+                "task_case_yaw": float(sampled_case["task_case"]["yaw"]),
+                "trajectory_length": int(common_length),
+                "pose_error_diff_mean": float(pose_diffs.mean()),
+                "pose_error_diff_final": float(pose_diffs[-1]),
+                "twist_diff_mean": float(twist_diffs.mean()),
+                "xy_error_diff_mean": float(xy_diffs.mean()),
+                "z_gap_diff_mean": float(z_gap_diffs.mean()),
+                "rot_error_diff_mean": float(rot_diffs.mean()),
+            }
+        )
+
+    if results:
+        pose_mean = np.asarray([item["pose_error_diff_mean"] for item in results], dtype=np.float64)
+        pose_final = np.asarray([item["pose_error_diff_final"] for item in results], dtype=np.float64)
+        print("\nClosed-loop invariance probe:")
+        print(
+            "  sampled states="
+            f"{len(results)}, mean pose_error_body divergence={pose_mean.mean():.4f}, "
+            f"mean final divergence={pose_final.mean():.4f}"
+        )
+    else:
+        print("\nClosed-loop invariance probe: no successful default states available.")
+    return results, sampling_rng
 
 
 def peek_spacemouse_intervention(env) -> Tuple[Optional[np.ndarray], bool]:
@@ -800,73 +1296,139 @@ def actor(agent, data_store, intvn_data_store, env, sampling_rng):
             height=FLAGS.eval_video_height,
             camera=FLAGS.eval_video_camera,
         )
+        eval_reset_options = (
+            {"sample_task_case": True} if FLAGS.eval_sample_task_case else None
+        )
+        if FLAGS.eval_sample_task_case:
+            print(
+                "Eval task-case preset: "
+                f"{FLAGS.eval_task_case_range_preset} | "
+                f"NRIC={'off' if FLAGS.eval_disable_nric else 'on'} | "
+                f"nullspace={'zero' if FLAGS.eval_zero_nullspace else 'default'}"
+            )
+        diagnostics_rng = np.random.default_rng(FLAGS.seed)
 
         try:
-            for episode in range(FLAGS.eval_n_trajs):
-                obs, _ = env.reset()
-                video_recorder.start_episode(episode)
-                renderer.maybe_render(force=True)
-                done = False
-                episode_steps = 0
-                episode_start_wall_time = time.perf_counter()
-                episode_start_sim_time = float(raw_env.data.time)
-                while not done:
-                    sampling_rng, key = jax.random.split(sampling_rng)
-                    actions = agent.sample_actions(
-                        observations=jax.device_put(obs),
-                        argmax=True,
-                        seed=key,
-                    )
-                    actions = np.asarray(jax.device_get(actions))
-                    next_obs, reward, done, truncated, info = env.step(actions)
-                    episode_steps += 1
-                    if FLAGS.eval_realtime_factor > 0.0:
-                        sim_elapsed = float(raw_env.data.time) - episode_start_sim_time
-                        wall_elapsed = time.perf_counter() - episode_start_wall_time
-                        target_wall_elapsed = (
-                            sim_elapsed * FLAGS.eval_realtime_factor
-                        )
-                        sleep_s = target_wall_elapsed - wall_elapsed
-                        if sleep_s > 0.0:
-                            time.sleep(sleep_s)
-                    renderer.maybe_render()
-                    video_recorder.maybe_capture()
-                    obs = next_obs
-                    done = done or truncated
-                episode_wall_time = time.perf_counter() - episode_start_wall_time
-                episode_sim_time = float(raw_env.data.time) - episode_start_sim_time
-                if info.get("success", False):
-                    success_counter += 1
-                    success_step_list.append(episode_steps)
-                    success_sim_time_list.append(episode_sim_time)
-                    success_wall_time_list.append(episode_wall_time)
-
-                video_recorder.finish_episode()
+            if FLAGS.eval_transfer_diagnostics:
+                obs_wrapper = find_wrapper_by_name(env, "MujocoSERLObsWrapper")
+                proprio_keys = getattr(obs_wrapper, "proprio_keys", None)
+                print("\nTransfer diagnostics:")
+                print(f"  policy proprio keys: {proprio_keys}")
                 print(
-                    "Episode "
-                    f"{episode + 1}: success={info.get('success', False)}, "
-                    f"steps={episode_steps}, "
-                    f"success_sim_time={episode_sim_time:.2f}s, "
-                    f"success_wall_time={episode_wall_time:.2f}s"
+                    "  strict default-only train checkpoint, evaluating "
+                    "default and XY+yaw transfer buckets separately."
                 )
-                print(f"  running success rate: {success_counter}/{episode + 1}")
+
+                bucket_results = defaultdict(list)
+                successful_default_samples = []
+
+                for bucket in TRANSFER_BUCKET_ORDER:
+                    for episode_idx in range(FLAGS.eval_n_trajs):
+                        reset_options = sample_task_case_for_bucket(
+                            raw_env,
+                            bucket,
+                            diagnostics_rng,
+                        )
+                        collect_trace = bucket == "default"
+                        result, sampling_rng = run_eval_episode(
+                            agent=agent,
+                            env=env,
+                            raw_env=raw_env,
+                            sampling_rng=sampling_rng,
+                            renderer=renderer,
+                            video_recorder=video_recorder if bucket == "default" else None,
+                            reset_options=reset_options,
+                            realtime_factor=FLAGS.eval_realtime_factor,
+                            collect_trace=collect_trace,
+                        )
+                        bucket_results[bucket].append(result)
+                        if bucket == "default" and result["success"]:
+                            successful_default_samples.extend(result["trace"])
+                        print(
+                            f"[{TRANSFER_BUCKET_LABELS[bucket]}] "
+                            f"episode {episode_idx + 1}/{FLAGS.eval_n_trajs}: "
+                            f"success={result['success']}, steps={result['steps']}, "
+                            f"xy={result['xy_error']:.4f}, z_gap={result['z_gap']:.4f}, "
+                            f"rot={result['rot_error']:.4f}, "
+                            f"task_case=({result['task_case_x']:.4f}, "
+                            f"{result['task_case_y']:.4f}, "
+                            f"yaw={result['task_case_yaw']:.3f}), "
+                            f"reset_case=({result['reset_case_x']:.4f}, "
+                            f"{result['reset_case_y']:.4f}, "
+                            f"yaw={result['reset_case_yaw']:.3f})"
+                        )
+
+                summarize_bucket_results(bucket_results)
+                _, sampling_rng = run_policy_action_consistency_probe(
+                    agent=agent,
+                    env=env,
+                    raw_env=raw_env,
+                    sampling_rng=sampling_rng,
+                    default_samples=successful_default_samples,
+                    num_states=FLAGS.eval_transfer_probe_num_states,
+                    rng=diagnostics_rng,
+                )
+                _, sampling_rng = run_closed_loop_invariance_probe(
+                    agent=agent,
+                    env=env,
+                    raw_env=raw_env,
+                    sampling_rng=sampling_rng,
+                    default_samples=successful_default_samples,
+                    num_states=FLAGS.eval_transfer_probe_num_states,
+                    horizon=FLAGS.eval_transfer_probe_horizon,
+                    rng=diagnostics_rng,
+                )
+            else:
+                for episode in range(FLAGS.eval_n_trajs):
+                    result, sampling_rng = run_eval_episode(
+                        agent=agent,
+                        env=env,
+                        raw_env=raw_env,
+                        sampling_rng=sampling_rng,
+                        renderer=renderer,
+                        video_recorder=video_recorder,
+                        reset_options=eval_reset_options,
+                        realtime_factor=FLAGS.eval_realtime_factor,
+                        collect_trace=False,
+                    )
+                    if result["success"]:
+                        success_counter += 1
+                        success_step_list.append(result["steps"])
+                        success_sim_time_list.append(result["success_sim_time"])
+                        success_wall_time_list.append(result["success_wall_time"])
+
+                    print(
+                        "Episode "
+                        f"{episode + 1}: success={result['success']}, "
+                        f"steps={result['steps']}, "
+                        f"success_sim_time={result['success_sim_time']:.2f}s, "
+                        f"success_wall_time={result['success_wall_time']:.2f}s, "
+                        f"task_case=({result['task_case_x']:.4f}, "
+                        f"{result['task_case_y']:.4f}, "
+                        f"yaw={result['task_case_yaw']:.3f}), "
+                        f"reset_case=({result['reset_case_x']:.4f}, "
+                        f"{result['reset_case_y']:.4f}, "
+                        f"yaw={result['reset_case_yaw']:.3f})"
+                    )
+                    print(f"  running success rate: {success_counter}/{episode + 1}")
         finally:
             video_recorder.close()
 
-        print(f"Final success rate: {success_counter / FLAGS.eval_n_trajs}")
-        if success_sim_time_list:
-            print(
-                "Average success steps: "
-                f"{np.mean(success_step_list):.1f}"
-            )
-            print(
-                "Average simulated success time: "
-                f"{np.mean(success_sim_time_list):.2f}s"
-            )
-            print(
-                "Average wall-clock rollout time: "
-                f"{np.mean(success_wall_time_list):.2f}s"
-            )
+        if not FLAGS.eval_transfer_diagnostics:
+            print(f"Final success rate: {success_counter / FLAGS.eval_n_trajs}")
+            if success_sim_time_list:
+                print(
+                    "Average success steps: "
+                    f"{np.mean(success_step_list):.1f}"
+                )
+                print(
+                    "Average simulated success time: "
+                    f"{np.mean(success_sim_time_list):.2f}s"
+                )
+                print(
+                    "Average wall-clock rollout time: "
+                    f"{np.mean(success_wall_time_list):.2f}s"
+                )
         return
 
     start_step = 0
@@ -1218,6 +1780,10 @@ def main(_):
         f"Available: {list(CONFIG_MAPPING.keys())}"
     )
     config = CONFIG_MAPPING[FLAGS.exp_name]()
+    if FLAGS.eval_checkpoint_step:
+        setattr(config, "eval_task_case_range_preset", FLAGS.eval_task_case_range_preset)
+        setattr(config, "eval_disable_nric", FLAGS.eval_disable_nric)
+        setattr(config, "eval_zero_nullspace", FLAGS.eval_zero_nullspace)
 
     assert config.batch_size % num_devices == 0
     rng = jax.random.PRNGKey(FLAGS.seed)
