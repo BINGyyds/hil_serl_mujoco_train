@@ -84,6 +84,19 @@ flags.DEFINE_boolean("actor", False, "Whether this is an actor.")
 flags.DEFINE_string("ip", "localhost", "IP address of the learner.")
 flags.DEFINE_multi_string("demo_path", None, "Path(s) to the demo data.")
 flags.DEFINE_string("checkpoint_path", None, "Path to save checkpoints.")
+flags.DEFINE_enum(
+    "reset_perturbation_preset",
+    "default",
+    ["default", "yaw_only"],
+    "Reset perturbation preset for training, actor, and eval environments. "
+    "'default' keeps the current XY+yaw reset distribution; "
+    "'yaw_only' zeros reset XY and keeps only reset yaw.",
+)
+flags.DEFINE_float(
+    "reset_yaw_range_override",
+    -1.0,
+    "Optional reset yaw range override. Negative keeps the preset default.",
+)
 flags.DEFINE_integer("eval_checkpoint_step", 0, "Step to evaluate the checkpoint.")
 flags.DEFINE_integer("eval_n_trajs", 0, "Number of trajectories to evaluate.")
 flags.DEFINE_boolean(
@@ -94,10 +107,21 @@ flags.DEFINE_boolean(
 flags.DEFINE_enum(
     "eval_task_case_range_preset",
     "aligned",
-    ["aligned", "wide"],
+    ["aligned", "wide", "yaw_only"],
     "Task-case sampling range preset for eval. "
     "'aligned' matches the training reset distribution; "
-    "'wide' restores the broader XY+yaw transfer range.",
+    "'wide' restores the broader XY+yaw transfer range; "
+    "'yaw_only' samples only hole yaw and keeps task-case XY at zero.",
+)
+flags.DEFINE_float(
+    "eval_task_case_yaw_range_override",
+    -1.0,
+    "Optional eval task-case yaw range override. Negative keeps the preset default.",
+)
+flags.DEFINE_boolean(
+    "eval_zero_reset_perturbation",
+    False,
+    "Zero reset XY and reset yaw only for eval environments. Useful for pure hole yaw tests.",
 )
 flags.DEFINE_boolean(
     "eval_disable_nric",
@@ -197,6 +221,13 @@ sharding = jax.sharding.PositionalSharding(devices)
 
 def print_green(x):
     return print("\033[92m {}\033[00m".format(x))
+
+
+def optional_flag_float(value: float) -> Optional[float]:
+    """Convert a negative sentinel float flag into None."""
+    if value is None or value < 0.0:
+        return None
+    return float(value)
 
 
 def load_transition_file(path: str) -> list[Any]:
@@ -523,7 +554,14 @@ TRANSFER_BUCKET_LABELS = {
 }
 
 
-def sample_task_case_for_bucket(raw_env, bucket: str, rng: np.random.Generator):
+def sample_task_case_for_bucket(
+    raw_env,
+    bucket: str,
+    rng: np.random.Generator,
+    *,
+    task_case_range_preset: str = "aligned",
+    task_case_yaw_range_override: Optional[float] = None,
+):
     """Sample a deterministic-style eval case from one transfer bucket."""
     if bucket == "default":
         return None
@@ -552,11 +590,17 @@ def sample_task_case_for_bucket(raw_env, bucket: str, rng: np.random.Generator):
         yaw_mag = rng.uniform(yaw_low, yaw_high)
         yaw = float(yaw_mag * rng.choice([-1.0, 1.0]))
     elif bucket == "combined_xy_yaw":
-        radius = rng.uniform(0.002, 0.010)
-        angle = rng.uniform(0.0, 2.0 * np.pi)
-        xy = radius * np.array([np.cos(angle), np.sin(angle)], dtype=np.float64)
-        yaw_mag = rng.uniform(np.deg2rad(5.0), np.deg2rad(15.0))
-        yaw = float(yaw_mag * rng.choice([-1.0, 1.0]))
+        if task_case_range_preset == "yaw_only":
+            yaw_high = task_case_yaw_range_override
+            if yaw_high is None or yaw_high <= 0.0:
+                yaw_high = float(raw_env.insertion_cfg.eval_case_yaw_range)
+            yaw = float(rng.uniform(-yaw_high, yaw_high))
+        else:
+            radius = rng.uniform(0.002, 0.010)
+            angle = rng.uniform(0.0, 2.0 * np.pi)
+            xy = radius * np.array([np.cos(angle), np.sin(angle)], dtype=np.float64)
+            yaw_mag = rng.uniform(np.deg2rad(5.0), np.deg2rad(15.0))
+            yaw = float(yaw_mag * rng.choice([-1.0, 1.0]))
     else:
         raise ValueError(f"Unknown transfer bucket: {bucket}")
 
@@ -717,12 +761,20 @@ def run_policy_action_consistency_probe(
     default_samples: list[dict[str, Any]],
     num_states: int,
     rng: np.random.Generator,
+    task_case_range_preset: str,
+    task_case_yaw_range_override: Optional[float],
 ):
     """Check whether matched task-relative states produce similar policy actions."""
     selected_samples = select_probe_samples(default_samples, num_states)
     results = []
     for idx, sample in enumerate(selected_samples):
-        sampled_case = sample_task_case_for_bucket(raw_env, "combined_xy_yaw", rng)
+        sampled_case = sample_task_case_for_bucket(
+            raw_env,
+            "combined_xy_yaw",
+            rng,
+            task_case_range_preset=task_case_range_preset,
+            task_case_yaw_range_override=task_case_yaw_range_override,
+        )
         if sampled_case is None:
             continue
 
@@ -851,12 +903,20 @@ def run_closed_loop_invariance_probe(
     num_states: int,
     horizon: int,
     rng: np.random.Generator,
+    task_case_range_preset: str,
+    task_case_yaw_range_override: Optional[float],
 ):
     """Compare closed-loop evolution under the same action sequence."""
     selected_samples = select_probe_samples(default_samples, max(1, min(num_states, 5)))
     results = []
     for idx, sample in enumerate(selected_samples):
-        sampled_case = sample_task_case_for_bucket(raw_env, "combined_xy_yaw", rng)
+        sampled_case = sample_task_case_for_bucket(
+            raw_env,
+            "combined_xy_yaw",
+            rng,
+            task_case_range_preset=task_case_range_preset,
+            task_case_yaw_range_override=task_case_yaw_range_override,
+        )
         if sampled_case is None:
             continue
 
@@ -1436,14 +1496,23 @@ def actor(agent, data_store, intvn_data_store, env, sampling_rng):
         eval_reset_options = (
             {"sample_task_case": True} if FLAGS.eval_sample_task_case else None
         )
+        reset_mode = (
+            "zeroed"
+            if FLAGS.eval_zero_reset_perturbation
+            else FLAGS.reset_perturbation_preset
+        )
         if FLAGS.eval_sample_task_case:
             print(
                 "Eval task-case preset: "
                 f"{FLAGS.eval_task_case_range_preset} | "
+                f"reset={reset_mode} | "
                 f"NRIC={'off' if FLAGS.eval_disable_nric else 'on'} | "
                 f"nullspace={'zero' if FLAGS.eval_zero_nullspace else 'default'}"
             )
         diagnostics_rng = np.random.default_rng(FLAGS.seed)
+        eval_task_case_yaw_range_override = optional_flag_float(
+            FLAGS.eval_task_case_yaw_range_override
+        )
 
         try:
             if FLAGS.eval_transfer_diagnostics:
@@ -1452,8 +1521,8 @@ def actor(agent, data_store, intvn_data_store, env, sampling_rng):
                 print("\nTransfer diagnostics:")
                 print(f"  policy proprio keys: {proprio_keys}")
                 print(
-                    "  strict default-only train checkpoint, evaluating "
-                    "default and XY+yaw transfer buckets separately."
+                    "  evaluating default and transfer buckets separately "
+                    "under the current reset/task-case presets."
                 )
 
                 bucket_results = defaultdict(list)
@@ -1465,6 +1534,8 @@ def actor(agent, data_store, intvn_data_store, env, sampling_rng):
                             raw_env,
                             bucket,
                             diagnostics_rng,
+                            task_case_range_preset=FLAGS.eval_task_case_range_preset,
+                            task_case_yaw_range_override=eval_task_case_yaw_range_override,
                         )
                         collect_trace = bucket == "default"
                         result, sampling_rng = run_eval_episode(
@@ -1504,6 +1575,8 @@ def actor(agent, data_store, intvn_data_store, env, sampling_rng):
                     default_samples=successful_default_samples,
                     num_states=FLAGS.eval_transfer_probe_num_states,
                     rng=diagnostics_rng,
+                    task_case_range_preset=FLAGS.eval_task_case_range_preset,
+                    task_case_yaw_range_override=eval_task_case_yaw_range_override,
                 )
                 _, sampling_rng = run_closed_loop_invariance_probe(
                     agent=agent,
@@ -1514,6 +1587,8 @@ def actor(agent, data_store, intvn_data_store, env, sampling_rng):
                     num_states=FLAGS.eval_transfer_probe_num_states,
                     horizon=FLAGS.eval_transfer_probe_horizon,
                     rng=diagnostics_rng,
+                    task_case_range_preset=FLAGS.eval_task_case_range_preset,
+                    task_case_yaw_range_override=eval_task_case_yaw_range_override,
                 )
             else:
                 for episode in range(FLAGS.eval_n_trajs):
@@ -1917,10 +1992,25 @@ def main(_):
         f"Available: {list(CONFIG_MAPPING.keys())}"
     )
     config = CONFIG_MAPPING[FLAGS.exp_name]()
-    if FLAGS.eval_checkpoint_step:
-        setattr(config, "eval_task_case_range_preset", FLAGS.eval_task_case_range_preset)
-        setattr(config, "eval_disable_nric", FLAGS.eval_disable_nric)
-        setattr(config, "eval_zero_nullspace", FLAGS.eval_zero_nullspace)
+    setattr(config, "reset_perturbation_preset", FLAGS.reset_perturbation_preset)
+    setattr(
+        config,
+        "reset_yaw_range_override",
+        optional_flag_float(FLAGS.reset_yaw_range_override),
+    )
+    setattr(config, "eval_task_case_range_preset", FLAGS.eval_task_case_range_preset)
+    setattr(
+        config,
+        "eval_task_case_yaw_range_override",
+        optional_flag_float(FLAGS.eval_task_case_yaw_range_override),
+    )
+    setattr(
+        config,
+        "eval_zero_reset_perturbation",
+        FLAGS.eval_zero_reset_perturbation if FLAGS.eval_checkpoint_step else False,
+    )
+    setattr(config, "eval_disable_nric", FLAGS.eval_disable_nric)
+    setattr(config, "eval_zero_nullspace", FLAGS.eval_zero_nullspace)
 
     assert config.batch_size % num_devices == 0
     rng = jax.random.PRNGKey(FLAGS.seed)
