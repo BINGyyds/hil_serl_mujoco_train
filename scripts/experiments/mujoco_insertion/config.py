@@ -24,6 +24,7 @@ class TrainConfig(DefaultTrainingConfig):
     proprio_keys = [
         "pose_error_body",
         "twist_body",
+        "wrench_control_body",
     ]
     setup_mode = "single-arm-fixed-gripper"
     encoder_type = "none"

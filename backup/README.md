@@ -90,3 +90,44 @@ Obsservation Action Controller全都放到body-frame下的SE(3)量进行训练�
 
 - `reward_rot_weight = 1.2`
 
+## 20260517 训练备份
+
+在0515训练基础上
+1. 对Observation进行改造，新增wrench_control_body：6 维局部 wrench，定义在当前 control frame（tool_mount / attachment frame），现在Observation是18维向量
+2. 对Reward进行重构，使用 pose_error_body、twist_body、wrench_control_body 构造主要 dense reward，同时保留任务语义最强的 task-frame 项。
+
+误差向量：
+* e_p = ||pose_error_body[:3]||
+* e_r = ||pose_error_body[3:]||
+* v_lin = ||twist_body[:3]||
+* v_ang = ||twist_body[3:]||
+* f_lat = ||wrench_control_body[:2]||
+* tau_lat = ||wrench_control_body[3:5]||
+
+权重：
+* w_ep = 1.0
+* w_er = 3.0
+* w_vlin = 0.15
+* w_vang = 0.10
+* w_flat = 0.20
+* w_tlat = 0.10
+
+Reward：
+r =
+  - w_ep   * e_p
+  - w_er   * e_r
+  - w_vlin * v_lin
+  - w_vang * v_ang
+  - w_flat * f_lat
+  - w_tlat * tau_lat
+  + depth_reward_if_aligned
+  - step_penalty
+  + success_bonus
+  - failure_penalty
+
+## 训练结果
+
+与0515结果类似，目前是能够对hole的XY做泛化，但是对yaw的泛化不足
+![alt text](<Screenshot from 2026-05-18 15-27-46.png>)
+![alt text](<Screenshot from 2026-05-18 15-28-11.png>)
+

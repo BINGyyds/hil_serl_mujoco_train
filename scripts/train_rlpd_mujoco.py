@@ -56,6 +56,7 @@ import numpy as np
 import tqdm
 from absl import app, flags
 from flax.training import checkpoints
+import gymnasium as gym
 from gymnasium.wrappers.record_episode_statistics import RecordEpisodeStatistics
 from natsort import natsorted
 
@@ -224,6 +225,110 @@ def load_transition_file(path: str) -> list[Any]:
             f"{demo_path}"
         )
     return transitions
+
+
+def _space_matches_value(
+    space: gym.Space,
+    value: Any,
+    *,
+    field_path: str,
+    source_label: str,
+) -> None:
+    """Raise a clear error when saved transition data mismatches env schema."""
+    if isinstance(space, gym.spaces.Box):
+        array = np.asarray(value)
+        if array.shape != space.shape:
+            raise ValueError(
+                "Saved transition schema does not match the current environment. "
+                f"{source_label}: expected {field_path} shape {space.shape}, "
+                f"got {array.shape}. "
+                "This usually means the data was recorded before the observation "
+                "change to `pose_error_body + twist_body + wrench_control_body`. "
+                "Please re-record demos and use a fresh checkpoint directory "
+                "without old `buffer/` or `demo_buffer/` contents."
+            )
+        return
+
+    if isinstance(space, gym.spaces.Dict):
+        if not isinstance(value, dict):
+            raise ValueError(
+                "Saved transition schema does not match the current environment. "
+                f"{source_label}: expected dict-like data at {field_path}, "
+                f"got {type(value)!r}. "
+                "Please re-record demos and use a fresh checkpoint directory."
+            )
+        for key, subspace in space.spaces.items():
+            if key not in value:
+                raise ValueError(
+                    "Saved transition schema does not match the current environment. "
+                    f"{source_label}: missing key {field_path}/{key}. "
+                    "Please re-record demos and use a fresh checkpoint directory."
+                )
+            _space_matches_value(
+                subspace,
+                value[key],
+                field_path=f"{field_path}/{key}",
+                source_label=source_label,
+            )
+        return
+
+
+def validate_transition_schema(
+    transition: dict[str, Any],
+    *,
+    observation_space: gym.Space,
+    action_space: gym.Space,
+    source_label: str,
+) -> None:
+    """Validate one stored transition against the current env I/O schema."""
+    required_keys = ("observations", "next_observations", "actions")
+    for key in required_keys:
+        if key not in transition:
+            raise ValueError(
+                "Saved transition schema is incomplete. "
+                f"{source_label}: missing top-level key {key!r}."
+            )
+    _space_matches_value(
+        observation_space,
+        transition["observations"],
+        field_path="observations",
+        source_label=source_label,
+    )
+    _space_matches_value(
+        observation_space,
+        transition["next_observations"],
+        field_path="next_observations",
+        source_label=source_label,
+    )
+    _space_matches_value(
+        action_space,
+        transition["actions"],
+        field_path="actions",
+        source_label=source_label,
+    )
+
+
+def insert_validated_transitions(
+    *,
+    replay_buffer,
+    transitions: list[Any],
+    observation_space: gym.Space,
+    action_space: gym.Space,
+    source_label: str,
+) -> None:
+    """Validate transitions before inserting so schema errors are easy to read."""
+    for idx, transition in enumerate(transitions):
+        if not isinstance(transition, dict):
+            raise ValueError(
+                f"{source_label}: transition {idx} is {type(transition)!r}, expected dict."
+            )
+        validate_transition_schema(
+            transition,
+            observation_space=observation_space,
+            action_space=action_space,
+            source_label=f"{source_label} transition {idx}",
+        )
+        replay_buffer.insert(transition)
 
 
 def resolve_metrics_dir() -> Optional[Path]:
@@ -465,6 +570,10 @@ def capture_transfer_metrics(raw_env) -> dict[str, Any]:
     return {
         "pose_error_body": np.asarray(raw_obs["state"]["pose_error_body"], dtype=np.float64),
         "twist_body": np.asarray(raw_obs["state"]["twist_body"], dtype=np.float64),
+        "wrench_control_body": np.asarray(
+            raw_obs["state"]["wrench_control_body"],
+            dtype=np.float64,
+        ),
         "xy_error": float(info["xy_error"]),
         "z_gap": float(info["z_gap"]),
         "rot_error": float(info["rot_error"]),
@@ -660,6 +769,18 @@ def run_policy_action_consistency_probe(
                 - np.asarray(case_raw_obs["state"]["twist_body"], dtype=np.float64)
             )
         )
+        wrench_diff = float(
+            np.linalg.norm(
+                np.asarray(
+                    default_raw_obs["state"]["wrench_control_body"],
+                    dtype=np.float64,
+                )
+                - np.asarray(
+                    case_raw_obs["state"]["wrench_control_body"],
+                    dtype=np.float64,
+                )
+            )
+        )
         results.append(
             {
                 "index": idx,
@@ -668,6 +789,7 @@ def run_policy_action_consistency_probe(
                 "action_diff": action_diff,
                 "pose_error_diff": pose_error_diff,
                 "twist_diff": twist_diff,
+                "wrench_diff": wrench_diff,
             }
         )
 
@@ -675,6 +797,7 @@ def run_policy_action_consistency_probe(
         action_diffs = np.asarray([item["action_diff"] for item in results], dtype=np.float64)
         pose_diffs = np.asarray([item["pose_error_diff"] for item in results], dtype=np.float64)
         twist_diffs = np.asarray([item["twist_diff"] for item in results], dtype=np.float64)
+        wrench_diffs = np.asarray([item["wrench_diff"] for item in results], dtype=np.float64)
         print("\nPolicy action consistency probe:")
         print(
             "  sampled states="
@@ -684,7 +807,8 @@ def run_policy_action_consistency_probe(
         print(
             "  matched observation diffs: "
             f"pose_error_body mean={pose_diffs.mean():.6f}, "
-            f"twist_body mean={twist_diffs.mean():.6f}"
+            f"twist_body mean={twist_diffs.mean():.6f}, "
+            f"wrench_control_body mean={wrench_diffs.mean():.6f}"
         )
     else:
         print("\nPolicy action consistency probe: no successful default states available.")
@@ -778,6 +902,16 @@ def run_closed_loop_invariance_probe(
             ],
             dtype=np.float64,
         )
+        wrench_diffs = np.asarray(
+            [
+                np.linalg.norm(
+                    default_traj[t]["wrench_control_body"]
+                    - case_traj[t]["wrench_control_body"]
+                )
+                for t in range(common_length)
+            ],
+            dtype=np.float64,
+        )
         xy_diffs = np.asarray(
             [
                 abs(default_traj[t]["xy_error"] - case_traj[t]["xy_error"])
@@ -809,6 +943,7 @@ def run_closed_loop_invariance_probe(
                 "pose_error_diff_mean": float(pose_diffs.mean()),
                 "pose_error_diff_final": float(pose_diffs[-1]),
                 "twist_diff_mean": float(twist_diffs.mean()),
+                "wrench_diff_mean": float(wrench_diffs.mean()),
                 "xy_error_diff_mean": float(xy_diffs.mean()),
                 "z_gap_diff_mean": float(z_gap_diffs.mean()),
                 "rot_error_diff_mean": float(rot_diffs.mean()),
@@ -818,11 +953,13 @@ def run_closed_loop_invariance_probe(
     if results:
         pose_mean = np.asarray([item["pose_error_diff_mean"] for item in results], dtype=np.float64)
         pose_final = np.asarray([item["pose_error_diff_final"] for item in results], dtype=np.float64)
+        wrench_mean = np.asarray([item["wrench_diff_mean"] for item in results], dtype=np.float64)
         print("\nClosed-loop invariance probe:")
         print(
             "  sampled states="
             f"{len(results)}, mean pose_error_body divergence={pose_mean.mean():.4f}, "
-            f"mean final divergence={pose_final.mean():.4f}"
+            f"mean final divergence={pose_final.mean():.4f}, "
+            f"mean wrench divergence={wrench_mean.mean():.4f}"
         )
     else:
         print("\nClosed-loop invariance probe: no successful default states available.")
@@ -1845,8 +1982,13 @@ def main(_):
         if FLAGS.demo_path is not None:
             for path in FLAGS.demo_path:
                 transitions = load_transition_file(path)
-                for transition in transitions:
-                    demo_buffer.insert(transition)
+                insert_validated_transitions(
+                    replay_buffer=demo_buffer,
+                    transitions=transitions,
+                    observation_space=env.observation_space,
+                    action_space=env.action_space,
+                    source_label=f"demo file {path}",
+                )
             print_green(f"demo buffer size: {len(demo_buffer)}")
 
         if FLAGS.checkpoint_path is not None and os.path.exists(
@@ -1857,8 +1999,13 @@ def main(_):
             ):
                 with open(file, "rb") as f:
                     transitions = pkl.load(f)
-                    for transition in transitions:
-                        replay_buffer.insert(transition)
+                    insert_validated_transitions(
+                        replay_buffer=replay_buffer,
+                        transitions=transitions,
+                        observation_space=env.observation_space,
+                        action_space=env.action_space,
+                        source_label=f"checkpoint replay buffer file {file}",
+                    )
             print_green(
                 f"Loaded previous buffer data. Replay buffer size: {len(replay_buffer)}"
             )
@@ -1871,8 +2018,13 @@ def main(_):
             ):
                 with open(file, "rb") as f:
                     transitions = pkl.load(f)
-                    for transition in transitions:
-                        demo_buffer.insert(transition)
+                    insert_validated_transitions(
+                        replay_buffer=demo_buffer,
+                        transitions=transitions,
+                        observation_space=env.observation_space,
+                        action_space=env.action_space,
+                        source_label=f"checkpoint demo buffer file {file}",
+                    )
             print_green(
                 f"Loaded previous demo buffer data. Demo buffer size: {len(demo_buffer)}"
             )
