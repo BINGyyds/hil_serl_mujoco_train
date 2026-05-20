@@ -438,7 +438,10 @@ def plot_metrics(
     *,
     bins: int = 300,
     png_dpi: int = 600,
-    save_pdf: bool = True,
+    save_pdf: bool = False,
+    include_reward_curve: bool = False,
+    include_success_curve: bool = False,
+    include_intervention_curve: bool = False,
 ) -> list[Path]:
     """Generate publication-style plots from ``episode_metrics.csv``.
 
@@ -472,28 +475,30 @@ def plot_metrics(
     intervention_steps = _as_float_array(rows, "intervention_steps")
 
     outputs: list[Path] = []
-    outputs.extend(
-        _save_return_curve(
-            metrics_dir=metrics_dir,
-            x_label=x_label,
-            step_x=step_x,
-            returns=returns,
-            bins=bins,
-            png_dpi=png_dpi,
-            save_pdf=save_pdf,
+    if include_reward_curve:
+        outputs.extend(
+            _save_return_curve(
+                metrics_dir=metrics_dir,
+                x_label=x_label,
+                step_x=step_x,
+                returns=returns,
+                bins=bins,
+                png_dpi=png_dpi,
+                save_pdf=save_pdf,
+            )
         )
-    )
-    outputs.extend(
-        _save_success_curve(
-            metrics_dir=metrics_dir,
-            x_label=x_label,
-            step_x=step_x,
-            success=success,
-            bins=bins,
-            png_dpi=png_dpi,
-            save_pdf=save_pdf,
+    if include_success_curve:
+        outputs.extend(
+            _save_success_curve(
+                metrics_dir=metrics_dir,
+                x_label=x_label,
+                step_x=step_x,
+                success=success,
+                bins=bins,
+                png_dpi=png_dpi,
+                save_pdf=save_pdf,
+            )
         )
-    )
     outputs.extend(
         _save_error_curves(
             metrics_dir=metrics_dir,
@@ -520,17 +525,18 @@ def plot_metrics(
             save_pdf=save_pdf,
         )
     )
-    outputs.extend(
-        _save_intervention_curves(
-            metrics_dir=metrics_dir,
-            x_label=x_label,
-            step_x=step_x,
-            intervention_steps=intervention_steps,
-            bins=bins,
-            png_dpi=png_dpi,
-            save_pdf=save_pdf,
+    if include_intervention_curve:
+        outputs.extend(
+            _save_intervention_curves(
+                metrics_dir=metrics_dir,
+                x_label=x_label,
+                step_x=step_x,
+                intervention_steps=intervention_steps,
+                bins=bins,
+                png_dpi=png_dpi,
+                save_pdf=save_pdf,
+            )
         )
-    )
     return outputs
 
 
@@ -562,9 +568,29 @@ def main() -> None:
         help="DPI for PNG exports.",
     )
     parser.add_argument(
-        "--no-pdf",
+        "--pdf",
         action="store_true",
-        help="Disable vector PDF exports.",
+        help="Also export vector PDF files.",
+    )
+    parser.add_argument(
+        "--reward-curve",
+        action="store_true",
+        help="Also generate reward_curve.png/.pdf.",
+    )
+    parser.add_argument(
+        "--success-curve",
+        action="store_true",
+        help="Also generate success_curve.png/.pdf.",
+    )
+    parser.add_argument(
+        "--intervention-metrics",
+        action="store_true",
+        help="Also generate intervention_metrics.png/.pdf.",
+    )
+    parser.add_argument(
+        "--all-plots",
+        action="store_true",
+        help="Generate all optional plots in addition to the default two.",
     )
     args = parser.parse_args()
     plot_metrics(
@@ -572,7 +598,10 @@ def main() -> None:
         window=args.window,
         bins=args.bins,
         png_dpi=args.png_dpi,
-        save_pdf=not args.no_pdf,
+        save_pdf=args.pdf,
+        include_reward_curve=args.all_plots or args.reward_curve,
+        include_success_curve=args.all_plots or args.success_curve,
+        include_intervention_curve=args.all_plots or args.intervention_metrics,
     )
 
 

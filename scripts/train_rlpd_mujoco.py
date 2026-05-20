@@ -97,6 +97,14 @@ flags.DEFINE_float(
     -1.0,
     "Optional reset yaw range override. Negative keeps the preset default.",
 )
+flags.DEFINE_enum(
+    "proprio_preset",
+    "wrench",
+    ["wrench", "wrench_joint"],
+    "Policy observation preset. `wrench` uses the 18D "
+    "pose_error_body+twist_body+wrench_control_body observation; "
+    "`wrench_joint` also includes q_pos/q_vel for 32D.",
+)
 flags.DEFINE_integer("eval_checkpoint_step", 0, "Step to evaluate the checkpoint.")
 flags.DEFINE_integer("eval_n_trajs", 0, "Number of trajectories to evaluate.")
 flags.DEFINE_boolean(
@@ -114,6 +122,12 @@ flags.DEFINE_enum(
     "'yaw_only' samples only hole yaw and keeps task-case XY at zero.",
 )
 flags.DEFINE_float(
+    "eval_task_case_xy_range_override",
+    -1.0,
+    "Optional symmetric eval task-case XY range override in meters. "
+    "For example 0.02 samples x/y in [-0.02, 0.02]. Negative keeps the preset default.",
+)
+flags.DEFINE_float(
     "eval_task_case_yaw_range_override",
     -1.0,
     "Optional eval task-case yaw range override. Negative keeps the preset default.",
@@ -122,6 +136,13 @@ flags.DEFINE_boolean(
     "eval_zero_reset_perturbation",
     False,
     "Zero reset XY and reset yaw only for eval environments. Useful for pure hole yaw tests.",
+)
+flags.DEFINE_boolean(
+    "eval_task_case_moves_reset_anchor",
+    False,
+    "Move the reset/preinsert anchor together with sampled task_case during eval. "
+    "Default false keeps the initial peg reset anchored at the nominal preinsert pose, "
+    "so the policy must actively align to the moved hole.",
 )
 flags.DEFINE_boolean(
     "eval_disable_nric",
@@ -273,10 +294,9 @@ def _space_matches_value(
                 "Saved transition schema does not match the current environment. "
                 f"{source_label}: expected {field_path} shape {space.shape}, "
                 f"got {array.shape}. "
-                "This usually means the data was recorded before the observation "
-                "change to `pose_error_body + twist_body + wrench_control_body`. "
-                "Please re-record demos and use a fresh checkpoint directory "
-                "without old `buffer/` or `demo_buffer/` contents."
+                "This usually means the data was recorded with a different "
+                "`--proprio_preset`. Please use matching demos/checkpoints or "
+                "re-record demos with the current observation preset."
             )
         return
 
@@ -560,6 +580,7 @@ def sample_task_case_for_bucket(
     rng: np.random.Generator,
     *,
     task_case_range_preset: str = "aligned",
+    task_case_xy_range_override: Optional[float] = None,
     task_case_yaw_range_override: Optional[float] = None,
 ):
     """Sample a deterministic-style eval case from one transfer bucket."""
@@ -596,7 +617,10 @@ def sample_task_case_for_bucket(
                 yaw_high = float(raw_env.insertion_cfg.eval_case_yaw_range)
             yaw = float(rng.uniform(-yaw_high, yaw_high))
         else:
-            radius = rng.uniform(0.002, 0.010)
+            radius_high = task_case_xy_range_override
+            if radius_high is None or radius_high <= 0.0:
+                radius_high = 0.010
+            radius = rng.uniform(min(0.002, radius_high), radius_high)
             angle = rng.uniform(0.0, 2.0 * np.pi)
             xy = radius * np.array([np.cos(angle), np.sin(angle)], dtype=np.float64)
             yaw_mag = rng.uniform(np.deg2rad(5.0), np.deg2rad(15.0))
@@ -618,6 +642,8 @@ def capture_transfer_metrics(raw_env) -> dict[str, Any]:
             raw_obs["state"]["wrench_control_body"],
             dtype=np.float64,
         ),
+        "q_pos": np.asarray(raw_obs["state"]["q_pos"], dtype=np.float64),
+        "q_vel": np.asarray(raw_obs["state"]["q_vel"], dtype=np.float64),
         "xy_error": float(info["xy_error"]),
         "z_gap": float(info["z_gap"]),
         "rot_error": float(info["rot_error"]),
@@ -762,6 +788,7 @@ def run_policy_action_consistency_probe(
     num_states: int,
     rng: np.random.Generator,
     task_case_range_preset: str,
+    task_case_xy_range_override: Optional[float],
     task_case_yaw_range_override: Optional[float],
 ):
     """Check whether matched task-relative states produce similar policy actions."""
@@ -773,6 +800,7 @@ def run_policy_action_consistency_probe(
             "combined_xy_yaw",
             rng,
             task_case_range_preset=task_case_range_preset,
+            task_case_xy_range_override=task_case_xy_range_override,
             task_case_yaw_range_override=task_case_yaw_range_override,
         )
         if sampled_case is None:
@@ -833,6 +861,18 @@ def run_policy_action_consistency_probe(
                 )
             )
         )
+        q_pos_diff = float(
+            np.linalg.norm(
+                np.asarray(default_raw_obs["state"]["q_pos"], dtype=np.float64)
+                - np.asarray(case_raw_obs["state"]["q_pos"], dtype=np.float64)
+            )
+        )
+        q_vel_diff = float(
+            np.linalg.norm(
+                np.asarray(default_raw_obs["state"]["q_vel"], dtype=np.float64)
+                - np.asarray(case_raw_obs["state"]["q_vel"], dtype=np.float64)
+            )
+        )
         results.append(
             {
                 "index": idx,
@@ -842,6 +882,8 @@ def run_policy_action_consistency_probe(
                 "pose_error_diff": pose_error_diff,
                 "twist_diff": twist_diff,
                 "wrench_diff": wrench_diff,
+                "q_pos_diff": q_pos_diff,
+                "q_vel_diff": q_vel_diff,
             }
         )
 
@@ -850,6 +892,8 @@ def run_policy_action_consistency_probe(
         pose_diffs = np.asarray([item["pose_error_diff"] for item in results], dtype=np.float64)
         twist_diffs = np.asarray([item["twist_diff"] for item in results], dtype=np.float64)
         wrench_diffs = np.asarray([item["wrench_diff"] for item in results], dtype=np.float64)
+        q_pos_diffs = np.asarray([item["q_pos_diff"] for item in results], dtype=np.float64)
+        q_vel_diffs = np.asarray([item["q_vel_diff"] for item in results], dtype=np.float64)
         print("\nPolicy action consistency probe:")
         print(
             "  sampled states="
@@ -860,7 +904,9 @@ def run_policy_action_consistency_probe(
             "  matched observation diffs: "
             f"pose_error_body mean={pose_diffs.mean():.6f}, "
             f"twist_body mean={twist_diffs.mean():.6f}, "
-            f"wrench_control_body mean={wrench_diffs.mean():.6f}"
+            f"wrench_control_body mean={wrench_diffs.mean():.6f}, "
+            f"q_pos mean={q_pos_diffs.mean():.6f}, "
+            f"q_vel mean={q_vel_diffs.mean():.6f}"
         )
     else:
         print("\nPolicy action consistency probe: no successful default states available.")
@@ -904,6 +950,7 @@ def run_closed_loop_invariance_probe(
     horizon: int,
     rng: np.random.Generator,
     task_case_range_preset: str,
+    task_case_xy_range_override: Optional[float],
     task_case_yaw_range_override: Optional[float],
 ):
     """Compare closed-loop evolution under the same action sequence."""
@@ -915,6 +962,7 @@ def run_closed_loop_invariance_probe(
             "combined_xy_yaw",
             rng,
             task_case_range_preset=task_case_range_preset,
+            task_case_xy_range_override=task_case_xy_range_override,
             task_case_yaw_range_override=task_case_yaw_range_override,
         )
         if sampled_case is None:
@@ -972,6 +1020,20 @@ def run_closed_loop_invariance_probe(
             ],
             dtype=np.float64,
         )
+        q_pos_diffs = np.asarray(
+            [
+                np.linalg.norm(default_traj[t]["q_pos"] - case_traj[t]["q_pos"])
+                for t in range(common_length)
+            ],
+            dtype=np.float64,
+        )
+        q_vel_diffs = np.asarray(
+            [
+                np.linalg.norm(default_traj[t]["q_vel"] - case_traj[t]["q_vel"])
+                for t in range(common_length)
+            ],
+            dtype=np.float64,
+        )
         xy_diffs = np.asarray(
             [
                 abs(default_traj[t]["xy_error"] - case_traj[t]["xy_error"])
@@ -1004,6 +1066,8 @@ def run_closed_loop_invariance_probe(
                 "pose_error_diff_final": float(pose_diffs[-1]),
                 "twist_diff_mean": float(twist_diffs.mean()),
                 "wrench_diff_mean": float(wrench_diffs.mean()),
+                "q_pos_diff_mean": float(q_pos_diffs.mean()),
+                "q_vel_diff_mean": float(q_vel_diffs.mean()),
                 "xy_error_diff_mean": float(xy_diffs.mean()),
                 "z_gap_diff_mean": float(z_gap_diffs.mean()),
                 "rot_error_diff_mean": float(rot_diffs.mean()),
@@ -1014,12 +1078,16 @@ def run_closed_loop_invariance_probe(
         pose_mean = np.asarray([item["pose_error_diff_mean"] for item in results], dtype=np.float64)
         pose_final = np.asarray([item["pose_error_diff_final"] for item in results], dtype=np.float64)
         wrench_mean = np.asarray([item["wrench_diff_mean"] for item in results], dtype=np.float64)
+        q_pos_mean = np.asarray([item["q_pos_diff_mean"] for item in results], dtype=np.float64)
+        q_vel_mean = np.asarray([item["q_vel_diff_mean"] for item in results], dtype=np.float64)
         print("\nClosed-loop invariance probe:")
         print(
             "  sampled states="
             f"{len(results)}, mean pose_error_body divergence={pose_mean.mean():.4f}, "
             f"mean final divergence={pose_final.mean():.4f}, "
-            f"mean wrench divergence={wrench_mean.mean():.4f}"
+            f"mean wrench divergence={wrench_mean.mean():.4f}, "
+            f"mean q_pos divergence={q_pos_mean.mean():.4f}, "
+            f"mean q_vel divergence={q_vel_mean.mean():.4f}"
         )
     else:
         print("\nClosed-loop invariance probe: no successful default states available.")
@@ -1502,14 +1570,23 @@ def actor(agent, data_store, intvn_data_store, env, sampling_rng):
             else FLAGS.reset_perturbation_preset
         )
         if FLAGS.eval_sample_task_case:
+            reset_anchor_mode = (
+                "task_case"
+                if FLAGS.eval_task_case_moves_reset_anchor
+                else "fixed"
+            )
             print(
                 "Eval task-case preset: "
                 f"{FLAGS.eval_task_case_range_preset} | "
                 f"reset={reset_mode} | "
+                f"reset_anchor={reset_anchor_mode} | "
                 f"NRIC={'off' if FLAGS.eval_disable_nric else 'on'} | "
                 f"nullspace={'zero' if FLAGS.eval_zero_nullspace else 'default'}"
             )
         diagnostics_rng = np.random.default_rng(FLAGS.seed)
+        eval_task_case_xy_range_override = optional_flag_float(
+            FLAGS.eval_task_case_xy_range_override
+        )
         eval_task_case_yaw_range_override = optional_flag_float(
             FLAGS.eval_task_case_yaw_range_override
         )
@@ -1535,6 +1612,7 @@ def actor(agent, data_store, intvn_data_store, env, sampling_rng):
                             bucket,
                             diagnostics_rng,
                             task_case_range_preset=FLAGS.eval_task_case_range_preset,
+                            task_case_xy_range_override=eval_task_case_xy_range_override,
                             task_case_yaw_range_override=eval_task_case_yaw_range_override,
                         )
                         collect_trace = bucket == "default"
@@ -1576,6 +1654,7 @@ def actor(agent, data_store, intvn_data_store, env, sampling_rng):
                     num_states=FLAGS.eval_transfer_probe_num_states,
                     rng=diagnostics_rng,
                     task_case_range_preset=FLAGS.eval_task_case_range_preset,
+                    task_case_xy_range_override=eval_task_case_xy_range_override,
                     task_case_yaw_range_override=eval_task_case_yaw_range_override,
                 )
                 _, sampling_rng = run_closed_loop_invariance_probe(
@@ -1588,6 +1667,7 @@ def actor(agent, data_store, intvn_data_store, env, sampling_rng):
                     horizon=FLAGS.eval_transfer_probe_horizon,
                     rng=diagnostics_rng,
                     task_case_range_preset=FLAGS.eval_task_case_range_preset,
+                    task_case_xy_range_override=eval_task_case_xy_range_override,
                     task_case_yaw_range_override=eval_task_case_yaw_range_override,
                 )
             else:
@@ -1992,6 +2072,10 @@ def main(_):
         f"Available: {list(CONFIG_MAPPING.keys())}"
     )
     config = CONFIG_MAPPING[FLAGS.exp_name]()
+    if hasattr(config, "set_proprio_preset"):
+        config.set_proprio_preset(FLAGS.proprio_preset)
+    else:
+        setattr(config, "proprio_preset", FLAGS.proprio_preset)
     setattr(config, "reset_perturbation_preset", FLAGS.reset_perturbation_preset)
     setattr(
         config,
@@ -2001,6 +2085,11 @@ def main(_):
     setattr(config, "eval_task_case_range_preset", FLAGS.eval_task_case_range_preset)
     setattr(
         config,
+        "eval_task_case_xy_range_override",
+        optional_flag_float(FLAGS.eval_task_case_xy_range_override),
+    )
+    setattr(
+        config,
         "eval_task_case_yaw_range_override",
         optional_flag_float(FLAGS.eval_task_case_yaw_range_override),
     )
@@ -2008,6 +2097,11 @@ def main(_):
         config,
         "eval_zero_reset_perturbation",
         FLAGS.eval_zero_reset_perturbation if FLAGS.eval_checkpoint_step else False,
+    )
+    setattr(
+        config,
+        "eval_task_case_moves_reset_anchor",
+        FLAGS.eval_task_case_moves_reset_anchor if FLAGS.eval_checkpoint_step else False,
     )
     setattr(config, "eval_disable_nric", FLAGS.eval_disable_nric)
     setattr(config, "eval_zero_nullspace", FLAGS.eval_zero_nullspace)

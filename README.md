@@ -57,7 +57,7 @@ python scripts/train_rlpd_mujoco.py \
   --actor \
   --ip localhost \
   --checkpoint_path output/mujoco_insertion_actor \
-  --norender_actor
+  --actor_viewer none
 ```
 
 ## checkpoint eval
@@ -66,7 +66,7 @@ python scripts/train_rlpd_mujoco.py \
 python scripts/train_rlpd_mujoco.py \
   --exp_name mujoco_insertion \
   --actor \
-  --checkpoint_path output/mujoco_insertion_local \
+  --checkpoint_path output/mujoco_insertion \
   --eval_checkpoint_step -1 \
   --eval_n_trajs 10
 ```
@@ -92,6 +92,40 @@ python scripts/train_rlpd_mujoco.py \
 
 当前会将所有 eval episode 拼接到一个总 MP4 中。
 
+## task-case 泛化评估
+
+默认 task-case eval 会固定 reset/preinsert anchor，只移动 hole/socket 和对应的 `goal_tip`，因此可以真实测试 policy 是否能主动对齐新 hole。日志中应看到 `reset_anchor=fixed`。
+
+```bash
+python scripts/train_rlpd_mujoco.py \
+  --exp_name mujoco_insertion \
+  --actor \
+  --checkpoint_path backup/20260517 \
+  --eval_checkpoint_step -1 \
+  --eval_n_trajs 20 \
+  --eval_sample_task_case \
+  --eval_task_case_range_preset wide \
+  --eval_zero_reset_perturbation \
+  --actor_viewer none
+```
+
+边界测试可扩大 task-case 采样范围：
+
+```bash
+python scripts/train_rlpd_mujoco.py \
+  --exp_name mujoco_insertion \
+  --actor \
+  --checkpoint_path backup/20260517 \
+  --eval_checkpoint_step -1 \
+  --eval_n_trajs 20 \
+  --eval_sample_task_case \
+  --eval_task_case_range_preset wide \
+  --eval_task_case_xy_range_override 0.02 \
+  --eval_task_case_yaw_range_override 0.4 \
+  --eval_zero_reset_perturbation \
+  --actor_viewer none
+```
+
 ## 本地训练指标
 
 learner 会持续写入：
@@ -102,9 +136,10 @@ output/.../metrics/episode_metrics.csv
 
 默认输出：
 
-- `reward_curve.png`
-- `success_curve.png`
 - `error_curve.png`
+- `training_performance.png`
+
+其他图和 PDF 通过绘图脚本的显式参数生成。
 
 手动画图：
 

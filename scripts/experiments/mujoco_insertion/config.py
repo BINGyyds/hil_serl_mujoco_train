@@ -5,6 +5,7 @@ Training configuration for the MuJoCo Franka insertion task with SpaceMouse HIL.
 from serl_robot_infra.configs.insertion_config import (
     build_eval_task_case_overrides,
     build_reset_perturbation_overrides,
+    get_proprio_keys,
     make_insertion_config,
 )
 from serl_robot_infra.envs.franka_insertion_env import FrankaInsertionEnv
@@ -19,11 +20,8 @@ from serl_launcher.wrappers.chunking import ChunkingWrapper
 class TrainConfig(DefaultTrainingConfig):
     image_keys = []
     classifier_keys = []
-    proprio_keys = [
-        "pose_error_body",
-        "twist_body",
-        "wrench_control_body",
-    ]
+    proprio_preset = "wrench"
+    proprio_keys = get_proprio_keys(proprio_preset)
     setup_mode = "single-arm-fixed-gripper"
     encoder_type = "none"
     use_reward_classifier = False
@@ -33,8 +31,8 @@ class TrainConfig(DefaultTrainingConfig):
     discount = 0.99
     cta_ratio = 2
 
-    max_steps = 2_000_000
-    replay_buffer_capacity = 2_000_000
+    max_steps = 5_000_000
+    replay_buffer_capacity = 5_000_000
     training_starts = 1000
     random_steps = 1000
     steps_per_update = 10
@@ -42,6 +40,10 @@ class TrainConfig(DefaultTrainingConfig):
     log_period = 100
     checkpoint_period = 5000
     buffer_period = 1000
+
+    def set_proprio_preset(self, preset: str) -> None:
+        self.proprio_preset = preset
+        self.proprio_keys = get_proprio_keys(preset)
 
     def get_environment(
         self,
@@ -65,12 +67,20 @@ class TrainConfig(DefaultTrainingConfig):
         overrides.update(
             build_eval_task_case_overrides(
                 preset=getattr(self, "eval_task_case_range_preset", "aligned"),
+                xy_range_override=getattr(
+                    self,
+                    "eval_task_case_xy_range_override",
+                    None,
+                ),
                 yaw_range_override=getattr(
                     self,
                     "eval_task_case_yaw_range_override",
                     None,
                 ),
             )
+        )
+        overrides["task_case_moves_reset_anchor"] = bool(
+            getattr(self, "eval_task_case_moves_reset_anchor", False)
         )
         if bool(getattr(self, "eval_disable_nric", False)):
             overrides["enable_nric"] = False
