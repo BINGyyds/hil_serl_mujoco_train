@@ -106,7 +106,8 @@ python scripts/train_rlpd_mujoco.py \
   --eval_sample_task_case \
   --eval_task_case_range_preset wide \
   --eval_zero_reset_perturbation \
-  --actor_viewer none
+  --actor_viewer none \
+  --eval_plot_dir backup/eval_plots_wide
 ```
 
 边界测试可扩大 task-case 采样范围：
@@ -123,8 +124,16 @@ python scripts/train_rlpd_mujoco.py \
   --eval_task_case_xy_range_override 0.02 \
   --eval_task_case_yaw_range_override 0.4 \
   --eval_zero_reset_perturbation \
-  --actor_viewer none
+  --actor_viewer none \
+  --eval_plot_dir backup/eval_plots_wide_xy20mm_yaw0p4
 ```
+
+`--eval_plot_dir` 会输出：
+
+- `eval_episode_offsets.png`：hole/task-case 与 peg/reset 的 X/Y/yaw 偏移，并画出采样上限；X/Y 单位为 `mm`，yaw 单位为 `rad`
+- `eval_contact_wrench.png`：每个 episode 内 control frame 下 tare 后的 `Fx/Fy/Fz` 与 `Tx/Ty/Tz` 最大绝对值，一行两列展示，每 `0.01s` 记录一次
+
+可选加 `--eval_compare_impedance_baseline`：每个 RL episode 结束后，从相同 `task_case/reset_case` 和相同初始仿真状态恢复，再跑一遍无 RL 的 SE(3) 阻抗目标跟踪 baseline。该 baseline 保留 NRIC，`eval_contact_wrench.png` 会用虚线加入 baseline 接触峰值。
 
 ## 本地训练指标
 

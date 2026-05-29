@@ -199,7 +199,6 @@ R_goal_case = R_task_case * B0
 - hole/socket 位姿按 `task_case` 改变
 - `goal_tip` 跟随 socket 正确改变，并保持默认工具-孔姿态偏置
 - reset/preinsert 起点固定在默认 preinsert anchor
-- 只有显式传 `--eval_task_case_moves_reset_anchor` 时，才恢复旧的 task-frame prealigned eval
 
 日志中应看到：
 
@@ -236,6 +235,13 @@ pose_error_body + twist_body + wrench_control_body
 ```
 
 即 XY `±20mm`、yaw `±0.4rad`。
+
+评估时可通过 `--eval_plot_dir` 同步导出两张评估图：
+
+- `eval_episode_offsets.png`：每个 episode 的 hole/task-case 与 peg/reset 的 X/Y/yaw 偏移，并画出采样上限 threshold；X/Y 单位为 `mm`，yaw 单位为 `rad`
+- `eval_contact_wrench.png`：每个 episode 内 control frame 下 tare 后的 `Fx/Fy/Fz` 与 `Tx/Ty/Tz` 最大绝对值，一行两列展示，每 `0.01s` 记录一次
+
+可选加 `--eval_compare_impedance_baseline` 对比无 RL 的 SE(3) 阻抗目标跟踪 baseline。baseline 与 RL 使用完全相同的 `task_case/reset_case` 和初始仿真状态，保留 NRIC，并在 `eval_contact_wrench.png` 中以虚线显示。
 
 ### 4. 当前判断
 

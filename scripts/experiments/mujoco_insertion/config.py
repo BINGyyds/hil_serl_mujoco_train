@@ -79,16 +79,6 @@ class TrainConfig(DefaultTrainingConfig):
                 ),
             )
         )
-        overrides["task_case_moves_reset_anchor"] = bool(
-            getattr(self, "eval_task_case_moves_reset_anchor", False)
-        )
-        if bool(getattr(self, "eval_disable_nric", False)):
-            overrides["enable_nric"] = False
-        if bool(getattr(self, "eval_zero_nullspace", False)):
-            overrides.update(
-                nullspace_stiffness=0.0,
-                nullspace_damping=0.0,
-            )
         cfg = make_insertion_config(**overrides)
         env = FrankaInsertionEnv(
             config=cfg,

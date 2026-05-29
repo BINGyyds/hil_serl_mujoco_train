@@ -138,23 +138,6 @@ flags.DEFINE_boolean(
     "Zero reset XY and reset yaw only for eval environments. Useful for pure hole yaw tests.",
 )
 flags.DEFINE_boolean(
-    "eval_task_case_moves_reset_anchor",
-    False,
-    "Move the reset/preinsert anchor together with sampled task_case during eval. "
-    "Default false keeps the initial peg reset anchored at the nominal preinsert pose, "
-    "so the policy must actively align to the moved hole.",
-)
-flags.DEFINE_boolean(
-    "eval_disable_nric",
-    False,
-    "Disable NRIC only for eval environments to isolate control-layer effects.",
-)
-flags.DEFINE_boolean(
-    "eval_zero_nullspace",
-    False,
-    "Set nullspace stiffness/damping to zero only for eval environments.",
-)
-flags.DEFINE_boolean(
     "eval_transfer_diagnostics",
     False,
     "Run strict default-only transfer diagnostics: bucketed eval, policy "
@@ -189,6 +172,18 @@ flags.DEFINE_string(
     "eval_video_camera",
     "tool_follow_camera",
     "Optional MuJoCo camera name for eval MP4. Defaults to tool_follow_camera.",
+)
+flags.DEFINE_string(
+    "eval_plot_dir",
+    None,
+    "Optional directory for eval summary plots. Writes eval_episode_offsets.png "
+    "and eval_contact_wrench.png.",
+)
+flags.DEFINE_boolean(
+    "eval_compare_impedance_baseline",
+    False,
+    "During standard eval, run a matched no-RL SE(3) impedance baseline after "
+    "each policy episode and include its contact wrench peaks in eval plots.",
 )
 flags.DEFINE_boolean("render_actor", True, "Render the MuJoCo actor environment.")
 flags.DEFINE_float(
@@ -658,6 +653,36 @@ def capture_transfer_metrics(raw_env) -> dict[str, Any]:
     }
 
 
+def capture_eval_wrench_sample(
+    raw_env,
+    *,
+    episode_start_sim_time: float,
+    eval_time_offset: float = 0.0,
+) -> dict[str, float]:
+    """Capture tare-compensated local control-frame wrench components."""
+    sim_time = eval_time_offset + float(raw_env.data.time) - episode_start_sim_time
+    if not hasattr(raw_env, "_get_control_frame_wrench"):
+        return {
+            "time": float(sim_time),
+            "force_x": float("nan"),
+            "force_y": float("nan"),
+            "force_z": float("nan"),
+            "torque_x": float("nan"),
+            "torque_y": float("nan"),
+            "torque_z": float("nan"),
+        }
+    wrench = np.asarray(raw_env._get_control_frame_wrench(), dtype=np.float64)
+    return {
+        "time": float(sim_time),
+        "force_x": float(wrench[0]),
+        "force_y": float(wrench[1]),
+        "force_z": float(wrench[2]),
+        "torque_x": float(wrench[3]),
+        "torque_y": float(wrench[4]),
+        "torque_z": float(wrench[5]),
+    }
+
+
 def sample_policy_action(agent, obs, sampling_rng):
     """Sample one deterministic policy action and return the advanced RNG."""
     sampling_rng, key = jax.random.split(sampling_rng)
@@ -680,9 +705,16 @@ def run_eval_episode(
     reset_options=None,
     realtime_factor: float = 0.0,
     collect_trace: bool = False,
+    collect_eval_plot_trace: bool = False,
+    eval_wrench_sample_interval: float = 0.01,
+    eval_plot_time_offset: float = 0.0,
+    capture_initial_snapshot: bool = False,
 ):
     """Run one eval episode and optionally collect per-step default-case states."""
     obs, _ = env.reset(options=reset_options)
+    initial_snapshot = (
+        raw_env.capture_diagnostic_snapshot() if capture_initial_snapshot else None
+    )
     if video_recorder is not None:
         video_recorder.start_episode(0)
     if renderer is not None:
@@ -690,8 +722,20 @@ def run_eval_episode(
     done = False
     episode_steps = 0
     episode_trace = []
+    episode_wrench_trace = []
     episode_start_wall_time = time.perf_counter()
     episode_start_sim_time = float(raw_env.data.time)
+    next_wrench_sample_time = 0.0
+
+    if collect_eval_plot_trace:
+        episode_wrench_trace.append(
+            capture_eval_wrench_sample(
+                raw_env,
+                episode_start_sim_time=episode_start_sim_time,
+                eval_time_offset=eval_plot_time_offset,
+            )
+        )
+        next_wrench_sample_time = max(float(eval_wrench_sample_interval), 1e-6)
 
     while not done:
         if collect_trace:
@@ -706,6 +750,21 @@ def run_eval_episode(
             episode_trace[-1]["action"] = actions.copy()
         next_obs, reward, terminated, truncated, info = env.step(actions)
         episode_steps += 1
+        if collect_eval_plot_trace:
+            sim_elapsed = float(raw_env.data.time) - episode_start_sim_time
+            if sim_elapsed + 1e-12 >= next_wrench_sample_time:
+                episode_wrench_trace.append(
+                    capture_eval_wrench_sample(
+                        raw_env,
+                        episode_start_sim_time=episode_start_sim_time,
+                        eval_time_offset=eval_plot_time_offset,
+                    )
+                )
+                while next_wrench_sample_time <= sim_elapsed + 1e-12:
+                    next_wrench_sample_time += max(
+                        float(eval_wrench_sample_interval),
+                        1e-6,
+                    )
         if realtime_factor > 0.0:
             sim_elapsed = float(raw_env.data.time) - episode_start_sim_time
             wall_elapsed = time.perf_counter() - episode_start_wall_time
@@ -741,8 +800,396 @@ def run_eval_episode(
         "reset_case_z": float(info.get("reset_case_z", 0.0)),
         "reset_case_yaw": float(info.get("reset_case_yaw", 0.0)),
         "trace": episode_trace,
+        "wrench_trace": episode_wrench_trace,
     }
+    if initial_snapshot is not None:
+        result["initial_snapshot"] = initial_snapshot
     return result, sampling_rng
+
+
+def run_impedance_baseline_episode(
+    *,
+    raw_env,
+    initial_snapshot: dict[str, Any],
+    eval_wrench_sample_interval: float = 0.01,
+) -> dict[str, Any]:
+    """Run a no-RL SE(3) impedance baseline from a matched initial state."""
+    raw_env.restore_diagnostic_snapshot(initial_snapshot)
+    done = False
+    episode_steps = 0
+    episode_start_sim_time = float(raw_env.data.time)
+    next_wrench_sample_time = 0.0
+    episode_wrench_trace = [
+        capture_eval_wrench_sample(
+            raw_env,
+            episode_start_sim_time=episode_start_sim_time,
+        )
+    ]
+    next_wrench_sample_time = max(float(eval_wrench_sample_interval), 1e-6)
+    info: dict[str, Any] = {}
+    zero_action = np.zeros(6, dtype=np.float64)
+
+    while not done:
+        if hasattr(raw_env, "set_controller_target_to_goal_tip"):
+            raw_env.set_controller_target_to_goal_tip()
+        else:
+            controller_state = raw_env._teleop_runtime.get_internal_state()
+            controller_state["target_tip_transform"] = raw_env._goal_tip_transform.copy()
+            controller_state["filtered_command"] = np.zeros(6, dtype=np.float64)
+            raw_env._teleop_runtime.set_internal_state(controller_state)
+
+        _, _, terminated, truncated, info = raw_env.step(zero_action)
+        episode_steps += 1
+        sim_elapsed = float(raw_env.data.time) - episode_start_sim_time
+        if sim_elapsed + 1e-12 >= next_wrench_sample_time:
+            episode_wrench_trace.append(
+                capture_eval_wrench_sample(
+                    raw_env,
+                    episode_start_sim_time=episode_start_sim_time,
+                )
+            )
+            while next_wrench_sample_time <= sim_elapsed + 1e-12:
+                next_wrench_sample_time += max(
+                    float(eval_wrench_sample_interval),
+                    1e-6,
+                )
+        done = terminated or truncated
+
+    episode_sim_time = float(raw_env.data.time) - episode_start_sim_time
+    return {
+        "success": bool(info.get("success", False)),
+        "steps": int(episode_steps),
+        "success_sim_time": float(episode_sim_time),
+        "xy_error": float(info.get("xy_error", np.nan)),
+        "z_gap": float(info.get("z_gap", np.nan)),
+        "rot_error": float(info.get("rot_error", np.nan)),
+        "task_case_x": float(info.get("task_case_x", 0.0)),
+        "task_case_y": float(info.get("task_case_y", 0.0)),
+        "task_case_yaw": float(info.get("task_case_yaw", 0.0)),
+        "reset_case_x": float(info.get("reset_case_x", 0.0)),
+        "reset_case_y": float(info.get("reset_case_y", 0.0)),
+        "reset_case_z": float(info.get("reset_case_z", 0.0)),
+        "reset_case_yaw": float(info.get("reset_case_yaw", 0.0)),
+        "wrench_trace": episode_wrench_trace,
+    }
+
+
+def _configure_eval_plot_style(plt) -> None:
+    plt.rcParams.update(
+        {
+            "figure.dpi": 150,
+            "savefig.dpi": 300,
+            "savefig.bbox": "tight",
+            "savefig.pad_inches": 0.04,
+            "font.family": "DejaVu Sans",
+            "font.size": 9,
+            "axes.labelsize": 9,
+            "axes.titlesize": 9,
+            "axes.titleweight": "regular",
+            "xtick.labelsize": 8,
+            "ytick.labelsize": 8,
+            "legend.fontsize": 8,
+            "axes.linewidth": 0.7,
+            "grid.linewidth": 0.35,
+            "lines.linewidth": 1.4,
+            "lines.markersize": 3.2,
+            "xtick.direction": "in",
+            "ytick.direction": "in",
+            "xtick.major.size": 3.0,
+            "ytick.major.size": 3.0,
+            "xtick.minor.size": 1.8,
+            "ytick.minor.size": 1.8,
+        }
+    )
+
+
+def _style_eval_axis(ax, *, xlabel: str | None = None, ylabel: str | None = None) -> None:
+    if xlabel:
+        ax.set_xlabel(xlabel)
+    if ylabel:
+        ax.set_ylabel(ylabel)
+    ax.grid(True, axis="y", alpha=0.18)
+    ax.minorticks_on()
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.tick_params(width=0.7)
+
+
+def _xy_limit_norm(low: np.ndarray, high: np.ndarray) -> float:
+    low = np.asarray(low, dtype=np.float64).reshape((-1,))
+    high = np.asarray(high, dtype=np.float64).reshape((-1,))
+    low = low[:2]
+    high = high[:2]
+    corners = np.asarray(
+        [
+            [low[0], low[1]],
+            [low[0], high[1]],
+            [high[0], low[1]],
+            [high[0], high[1]],
+        ],
+        dtype=np.float64,
+    )
+    return float(np.max(np.linalg.norm(corners, axis=1)))
+
+
+def _plot_eval_threshold(
+    ax,
+    value: float,
+    *,
+    label: str = "sample limit",
+    signed: bool = False,
+) -> None:
+    if not np.isfinite(value) or value <= 0.0:
+        return
+    limits = (value, -value) if signed else (value,)
+    for idx, limit in enumerate(limits):
+        ax.axhline(
+            limit,
+            color="#b22222",
+            linestyle="--",
+            linewidth=0.9,
+            alpha=0.72,
+            label=label if idx == 0 else None,
+        )
+
+
+def _set_symmetric_ylim(ax, values: np.ndarray, threshold: float) -> None:
+    finite_values = np.asarray(values[np.isfinite(values)], dtype=np.float64)
+    max_abs = float(np.max(np.abs(finite_values))) if finite_values.size else 0.0
+    max_abs = max(max_abs, abs(float(threshold)) if np.isfinite(threshold) else 0.0)
+    if max_abs <= 0.0:
+        max_abs = 1.0
+    # Keep a deliberately large top strip for legends so they do not cover data.
+    ax.set_ylim(-1.12 * max_abs, 1.90 * max_abs)
+
+
+def _set_positive_ylim(ax, values: list[np.ndarray]) -> None:
+    finite_values = np.concatenate(
+        [np.asarray(value[np.isfinite(value)], dtype=np.float64) for value in values]
+    )
+    ymax = float(np.max(finite_values)) if finite_values.size else 0.0
+    if ymax <= 0.0:
+        ymax = 1.0
+    # Contact plots can have 6 legend entries with the baseline enabled.
+    ax.set_ylim(0.0, 2.15 * ymax)
+
+
+def _place_eval_legend(ax, *, ncol: int = 1) -> None:
+    handles, labels = ax.get_legend_handles_labels()
+    if not handles:
+        return
+    legend = ax.legend(
+        handles,
+        labels,
+        frameon=False,
+        loc="upper right",
+        bbox_to_anchor=(0.992, 0.992),
+        ncol=ncol,
+        borderpad=0.3,
+        handlelength=1.6,
+        handletextpad=0.45,
+        labelspacing=0.35,
+        columnspacing=0.8,
+        fancybox=False,
+    )
+
+
+def _max_abs_wrench_component(trace: list[dict[str, float]], key: str) -> float:
+    values = np.asarray([item.get(key, np.nan) for item in trace], dtype=np.float64)
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return float("nan")
+    return float(np.max(np.abs(values)))
+
+
+def _collect_wrench_peak_components(
+    results: list[dict[str, Any]],
+    *,
+    source_key: str | None = None,
+) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray], bool]:
+    force_peaks = {axis: [] for axis in ("x", "y", "z")}
+    torque_peaks = {axis: [] for axis in ("x", "y", "z")}
+    has_data = False
+    for row in results:
+        source = row.get(source_key, {}) if source_key is not None else row
+        trace = source.get("wrench_trace", []) if isinstance(source, dict) else []
+        has_data = has_data or bool(trace)
+        for axis in ("x", "y", "z"):
+            force_peaks[axis].append(_max_abs_wrench_component(trace, f"force_{axis}"))
+            torque_peaks[axis].append(_max_abs_wrench_component(trace, f"torque_{axis}"))
+    return (
+        {axis: np.asarray(values, dtype=np.float64) for axis, values in force_peaks.items()},
+        {axis: np.asarray(values, dtype=np.float64) for axis, values in torque_peaks.items()},
+        has_data,
+    )
+
+
+def save_eval_plots(
+    *,
+    results: list[dict[str, Any]],
+    raw_env,
+    output_dir: str | Path,
+) -> list[Path]:
+    """Save publication-oriented eval summary plots."""
+    if not results:
+        return []
+
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from matplotlib.ticker import MaxNLocator
+    except ImportError as exc:
+        raise RuntimeError(
+            "--eval_plot_dir requires matplotlib. Activate the training env or install matplotlib."
+        ) from exc
+
+    _configure_eval_plot_style(plt)
+    output_dir = Path(output_dir).expanduser()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    episode_axis = np.arange(1, len(results) + 1, dtype=np.int64)
+    task_x = np.asarray([row["task_case_x"] * 1000.0 for row in results], dtype=np.float64)
+    task_y = np.asarray([row["task_case_y"] * 1000.0 for row in results], dtype=np.float64)
+    task_yaw = np.asarray([row["task_case_yaw"] for row in results], dtype=np.float64)
+    reset_x = np.asarray([row["reset_case_x"] * 1000.0 for row in results], dtype=np.float64)
+    reset_y = np.asarray([row["reset_case_y"] * 1000.0 for row in results], dtype=np.float64)
+    reset_yaw = np.asarray([row["reset_case_yaw"] for row in results], dtype=np.float64)
+
+    cfg = raw_env.insertion_cfg
+    task_xy_limit = max(
+        abs(float(np.asarray(cfg.eval_case_xy_low, dtype=np.float64)[0])),
+        abs(float(np.asarray(cfg.eval_case_xy_low, dtype=np.float64)[1])),
+        abs(float(np.asarray(cfg.eval_case_xy_high, dtype=np.float64)[0])),
+        abs(float(np.asarray(cfg.eval_case_xy_high, dtype=np.float64)[1])),
+    ) * 1000.0
+    task_yaw_limit = abs(float(cfg.eval_case_yaw_range))
+    reset_low = np.asarray(cfg.reset_pos_noise_low, dtype=np.float64)
+    reset_high = np.asarray(cfg.reset_pos_noise_high, dtype=np.float64)
+    reset_xy_limit = max(
+        abs(float(reset_low[0])),
+        abs(float(reset_low[1])),
+        abs(float(reset_high[0])),
+        abs(float(reset_high[1])),
+    ) * 1000.0
+    reset_yaw_limit = abs(float(cfg.reset_yaw_range))
+
+    outputs: list[Path] = []
+    fig, axes = plt.subplots(2, 2, figsize=(7.2, 4.75), sharex=True)
+    panels = [
+        (
+            axes[0, 0],
+            [(task_x, "x", "#1f77b4"), (task_y, "y", "#d62728")],
+            task_xy_limit,
+            "Hole/task-case XY offset",
+            "XY offset [mm]",
+        ),
+        (
+            axes[0, 1],
+            [(task_yaw, "yaw", "#9467bd")],
+            task_yaw_limit,
+            "Hole/task-case yaw offset",
+            "Yaw offset [rad]",
+        ),
+        (
+            axes[1, 0],
+            [(reset_x, "x", "#1f77b4"), (reset_y, "y", "#d62728")],
+            reset_xy_limit,
+            "Peg/reset XY offset",
+            "XY offset [mm]",
+        ),
+        (
+            axes[1, 1],
+            [(reset_yaw, "yaw", "#ff7f0e")],
+            reset_yaw_limit,
+            "Peg/reset yaw offset",
+            "Yaw offset [rad]",
+        ),
+    ]
+    for ax, series, threshold, title, ylabel in panels:
+        panel_values = []
+        for values, label, color in series:
+            ax.plot(episode_axis, values, marker="o", color=color, label=label)
+            panel_values.append(values)
+        _plot_eval_threshold(ax, threshold, signed=True)
+        ax.set_title(title)
+        _style_eval_axis(ax, xlabel="Episode", ylabel=ylabel)
+        ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+        _set_symmetric_ylim(ax, np.concatenate(panel_values), threshold)
+        _place_eval_legend(ax)
+    fig.tight_layout(pad=0.55)
+    offsets_path = output_dir / "eval_episode_offsets.png"
+    fig.savefig(offsets_path)
+    plt.close(fig)
+    outputs.append(offsets_path)
+
+    traces = [row.get("wrench_trace", []) for row in results]
+    fig, axes = plt.subplots(1, 2, figsize=(7.8, 3.55), sharex=True)
+    if any(traces):
+        force_peaks, torque_peaks, _ = _collect_wrench_peak_components(results)
+        baseline_force_peaks, baseline_torque_peaks, has_baseline = (
+            _collect_wrench_peak_components(results, source_key="impedance_baseline")
+        )
+        component_colors = {"x": "#1f77b4", "y": "#d62728", "z": "#2ca02c"}
+        force_ylim_values = []
+        torque_ylim_values = []
+        for axis in ("x", "y", "z"):
+            force_ylim_values.append(force_peaks[axis])
+            torque_ylim_values.append(torque_peaks[axis])
+            axes[0].plot(
+                episode_axis,
+                force_peaks[axis],
+                marker="o",
+                color=component_colors[axis],
+                linestyle="-",
+                label=f"RL $F_{axis}$",
+            )
+            axes[1].plot(
+                episode_axis,
+                torque_peaks[axis],
+                marker="o",
+                color=component_colors[axis],
+                linestyle="-",
+                label=f"RL $T_{axis}$",
+            )
+            if has_baseline:
+                force_ylim_values.append(baseline_force_peaks[axis])
+                torque_ylim_values.append(baseline_torque_peaks[axis])
+                axes[0].plot(
+                    episode_axis,
+                    baseline_force_peaks[axis],
+                    marker="s",
+                    color=component_colors[axis],
+                    linestyle="--",
+                    label=f"Imp. $F_{axis}$",
+                )
+                axes[1].plot(
+                    episode_axis,
+                    baseline_torque_peaks[axis],
+                    marker="s",
+                    color=component_colors[axis],
+                    linestyle="--",
+                    label=f"Imp. $T_{axis}$",
+                )
+        _set_positive_ylim(axes[0], force_ylim_values)
+        _set_positive_ylim(axes[1], torque_ylim_values)
+    axes[0].set_title("Peak control-frame contact force")
+    axes[1].set_title("Peak control-frame contact torque")
+    _style_eval_axis(axes[0], xlabel="Episode", ylabel="Peak |force| [N]")
+    _style_eval_axis(axes[1], xlabel="Episode", ylabel="Peak |torque| [N m]")
+    for ax in axes:
+        ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+        _place_eval_legend(ax, ncol=3)
+    fig.tight_layout(pad=0.55)
+    wrench_path = output_dir / "eval_contact_wrench.png"
+    fig.savefig(wrench_path)
+    plt.close(fig)
+    outputs.append(wrench_path)
+
+    for output in outputs:
+        print_green(f"Saved eval plot: {output}")
+    return outputs
 
 
 def summarize_bucket_results(bucket_results: dict[str, list[dict[str, Any]]]) -> None:
@@ -1529,6 +1976,7 @@ def actor(agent, data_store, intvn_data_store, env, sampling_rng):
         success_step_list = []
         success_sim_time_list = []
         success_wall_time_list = []
+        eval_results: list[dict[str, Any]] = []
         checkpoint_dir = os.path.abspath(FLAGS.checkpoint_path)
         checkpoint_step = (
             None if FLAGS.eval_checkpoint_step == -1 else FLAGS.eval_checkpoint_step
@@ -1570,18 +2018,11 @@ def actor(agent, data_store, intvn_data_store, env, sampling_rng):
             else FLAGS.reset_perturbation_preset
         )
         if FLAGS.eval_sample_task_case:
-            reset_anchor_mode = (
-                "task_case"
-                if FLAGS.eval_task_case_moves_reset_anchor
-                else "fixed"
-            )
             print(
                 "Eval task-case preset: "
                 f"{FLAGS.eval_task_case_range_preset} | "
                 f"reset={reset_mode} | "
-                f"reset_anchor={reset_anchor_mode} | "
-                f"NRIC={'off' if FLAGS.eval_disable_nric else 'on'} | "
-                f"nullspace={'zero' if FLAGS.eval_zero_nullspace else 'default'}"
+                "reset_anchor=fixed"
             )
         diagnostics_rng = np.random.default_rng(FLAGS.seed)
         eval_task_case_xy_range_override = optional_flag_float(
@@ -1593,6 +2034,16 @@ def actor(agent, data_store, intvn_data_store, env, sampling_rng):
 
         try:
             if FLAGS.eval_transfer_diagnostics:
+                if FLAGS.eval_plot_dir:
+                    print(
+                        "--eval_plot_dir is only used for standard eval; "
+                        "skipping eval plots during transfer diagnostics."
+                    )
+                if FLAGS.eval_compare_impedance_baseline:
+                    print(
+                        "--eval_compare_impedance_baseline is only used for standard eval; "
+                        "skipping impedance baseline during transfer diagnostics."
+                    )
                 obs_wrapper = find_wrapper_by_name(env, "MujocoSERLObsWrapper")
                 proprio_keys = getattr(obs_wrapper, "proprio_keys", None)
                 print("\nTransfer diagnostics:")
@@ -1671,6 +2122,7 @@ def actor(agent, data_store, intvn_data_store, env, sampling_rng):
                     task_case_yaw_range_override=eval_task_case_yaw_range_override,
                 )
             else:
+                eval_plot_time_offset = 0.0
                 for episode in range(FLAGS.eval_n_trajs):
                     result, sampling_rng = run_eval_episode(
                         agent=agent,
@@ -1682,7 +2134,26 @@ def actor(agent, data_store, intvn_data_store, env, sampling_rng):
                         reset_options=eval_reset_options,
                         realtime_factor=FLAGS.eval_realtime_factor,
                         collect_trace=False,
+                        collect_eval_plot_trace=bool(FLAGS.eval_plot_dir),
+                        eval_plot_time_offset=eval_plot_time_offset,
+                        capture_initial_snapshot=bool(
+                            FLAGS.eval_compare_impedance_baseline
+                        ),
                     )
+                    initial_snapshot = result.pop("initial_snapshot", None)
+                    if FLAGS.eval_compare_impedance_baseline:
+                        if initial_snapshot is None:
+                            raise RuntimeError(
+                                "Missing initial snapshot for impedance baseline eval."
+                            )
+                        baseline_result = run_impedance_baseline_episode(
+                            raw_env=raw_env,
+                            initial_snapshot=initial_snapshot,
+                        )
+                        result["impedance_baseline"] = baseline_result
+                    if FLAGS.eval_plot_dir:
+                        eval_plot_time_offset += result["success_sim_time"]
+                    eval_results.append(result)
                     if result["success"]:
                         success_counter += 1
                         success_step_list.append(result["steps"])
@@ -1702,11 +2173,28 @@ def actor(agent, data_store, intvn_data_store, env, sampling_rng):
                         f"{result['reset_case_y']:.4f}, "
                         f"yaw={result['reset_case_yaw']:.3f})"
                     )
+                    baseline_result = result.get("impedance_baseline")
+                    if baseline_result is not None:
+                        print(
+                            "  impedance baseline: "
+                            f"success={baseline_result['success']}, "
+                            f"steps={baseline_result['steps']}, "
+                            f"sim_time={baseline_result['success_sim_time']:.2f}s, "
+                            f"xy={baseline_result['xy_error']:.4f}, "
+                            f"z_gap={baseline_result['z_gap']:.4f}, "
+                            f"rot={baseline_result['rot_error']:.4f}"
+                        )
                     print(f"  running success rate: {success_counter}/{episode + 1}")
         finally:
             video_recorder.close()
 
         if not FLAGS.eval_transfer_diagnostics:
+            if FLAGS.eval_plot_dir:
+                save_eval_plots(
+                    results=eval_results,
+                    raw_env=raw_env,
+                    output_dir=FLAGS.eval_plot_dir,
+                )
             print(f"Final success rate: {success_counter / FLAGS.eval_n_trajs}")
             if success_sim_time_list:
                 print(
@@ -2098,14 +2586,6 @@ def main(_):
         "eval_zero_reset_perturbation",
         FLAGS.eval_zero_reset_perturbation if FLAGS.eval_checkpoint_step else False,
     )
-    setattr(
-        config,
-        "eval_task_case_moves_reset_anchor",
-        FLAGS.eval_task_case_moves_reset_anchor if FLAGS.eval_checkpoint_step else False,
-    )
-    setattr(config, "eval_disable_nric", FLAGS.eval_disable_nric)
-    setattr(config, "eval_zero_nullspace", FLAGS.eval_zero_nullspace)
-
     assert config.batch_size % num_devices == 0
     rng = jax.random.PRNGKey(FLAGS.seed)
     rng, sampling_rng = jax.random.split(rng)
